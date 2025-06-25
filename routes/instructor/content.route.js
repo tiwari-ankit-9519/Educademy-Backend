@@ -30,7 +30,7 @@ import {
   importCourseContent,
   previewContent,
   searchCourseContent,
-} from "../../controllers/instructors/instructorcourse.controller.js";
+} from "../../controllers/instructors/content.controller.js";
 import { requireInstructor } from "../../middlewares/middleware.js";
 
 const router = express.Router();

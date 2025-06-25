@@ -31,12 +31,7 @@ router.get("/detailed", getDetailedEarnings);
 
 router.get("/course/:courseId", getCourseEarnings);
 
-router.post(
-  "/payout/request",
-  payoutRateLimit,
-  validatePayoutRequest,
-  requestPayout
-);
+router.post("/payout/request", validatePayoutRequest, requestPayout);
 
 router.get("/payout/history", getPayoutHistory);
 

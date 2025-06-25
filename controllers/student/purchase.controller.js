@@ -1,20 +1,11 @@
 import { PrismaClient } from "@prisma/client";
 import asyncHandler from "express-async-handler";
-import Razorpay from "razorpay";
-import Stripe from "stripe";
-import crypto from "crypto";
 import redisService from "../../utils/redis.js";
 import emailService from "../../utils/emailService.js";
 import notificationService from "../../utils/notificationservice.js";
+import paymentService from "../../utils/paymentService.js";
 
 const prisma = new PrismaClient();
-
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const generateOrderId = () => {
   return `ORD_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -93,7 +84,7 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
     });
   }
 
-  if (!["RAZORPAY", "STRIPE", "PAYPAL"].includes(gateway)) {
+  if (!paymentService.validateGateway(gateway)) {
     return res.status(400).json({
       success: false,
       message: "Invalid payment gateway",
@@ -166,31 +157,29 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
     let gatewayOrderId = null;
     let clientSecret = null;
 
+    const orderData = {
+      amount: finalAmount,
+      currency: "INR",
+      receipt: orderId,
+      notes: {
+        orderId,
+        userId,
+        courses: courseIds.join(","),
+      },
+      metadata: {
+        orderId,
+        userId,
+        courses: courseIds.join(","),
+      },
+    };
+
+    const gatewayOrder = await paymentService.createOrder(gateway, orderData);
+
     if (gateway === "RAZORPAY") {
-      const razorpayOrder = await razorpay.orders.create({
-        amount: Math.round(finalAmount * 100),
-        currency: "INR",
-        receipt: orderId,
-        payment_capture: 1,
-        notes: {
-          orderId,
-          userId,
-          courses: courseIds.join(","),
-        },
-      });
-      gatewayOrderId = razorpayOrder.id;
+      gatewayOrderId = gatewayOrder.id;
     } else if (gateway === "STRIPE") {
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(finalAmount * 100),
-        currency: "inr",
-        metadata: {
-          orderId,
-          userId,
-          courses: courseIds.join(","),
-        },
-      });
-      gatewayOrderId = paymentIntent.id;
-      clientSecret = paymentIntent.client_secret;
+      gatewayOrderId = gatewayOrder.id;
+      clientSecret = gatewayOrder.client_secret;
     }
 
     const payment = await prisma.payment.create({
@@ -305,39 +294,47 @@ export const verifyPayment = asyncHandler(async (req, res) => {
 
   try {
     let isVerified = false;
+    let paymentDetails = null;
 
     if (gateway === "RAZORPAY") {
-      const expectedSignature = crypto
-        .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-        .update(`${orderId}|${paymentId}`)
-        .digest("hex");
-
-      isVerified = expectedSignature === signature;
+      isVerified = paymentService.verifyRazorpayPayment({
+        orderId,
+        paymentId,
+        signature,
+      });
 
       if (isVerified) {
-        const razorpayPayment = await razorpay.payments.fetch(paymentId);
+        paymentDetails = await paymentService.fetchPaymentDetails(
+          gateway,
+          paymentId
+        );
         await prisma.payment.update({
           where: { id: payment.id },
           data: {
             status: "COMPLETED",
-            method: razorpayPayment.method?.toUpperCase() || "CREDIT_CARD",
-            gatewayResponse: razorpayPayment,
+            method: paymentDetails.method?.toUpperCase() || "CREDIT_CARD",
+            gatewayResponse: paymentDetails,
           },
         });
       }
     } else if (gateway === "STRIPE") {
-      const paymentIntent = await stripe.paymentIntents.retrieve(paymentId);
-      isVerified = paymentIntent.status === "succeeded";
+      isVerified = await paymentService.verifyPayment(gateway, {
+        paymentIntentId: paymentId,
+      });
 
       if (isVerified) {
+        paymentDetails = await paymentService.fetchPaymentDetails(
+          gateway,
+          paymentId
+        );
         await prisma.payment.update({
           where: { id: payment.id },
           data: {
             status: "COMPLETED",
             method:
-              paymentIntent.payment_method_types[0]?.toUpperCase() ||
+              paymentDetails.payment_method_types[0]?.toUpperCase() ||
               "CREDIT_CARD",
-            gatewayResponse: paymentIntent,
+            gatewayResponse: paymentDetails,
           },
         });
       }
@@ -866,20 +863,15 @@ export const processRefund = asyncHandler(async (req, res) => {
   }
 
   try {
-    let refundResponse = null;
-
-    if (payment.gateway === "RAZORPAY") {
-      refundResponse = await razorpay.payments.refund(payment.transactionId, {
-        amount: Math.round(parseFloat(payment.amount) * 100),
+    const refundResponse = await paymentService.createRefund(
+      payment.gateway,
+      payment.transactionId,
+      {
+        amount: parseFloat(payment.amount),
         notes: { reason: refundRequest.reason, adminNotes },
-      });
-    } else if (payment.gateway === "STRIPE") {
-      refundResponse = await stripe.refunds.create({
-        payment_intent: payment.transactionId,
-        amount: Math.round(parseFloat(payment.amount) * 100),
         metadata: { reason: refundRequest.reason, adminNotes },
-      });
-    }
+      }
+    );
 
     await prisma.payment.update({
       where: { id: paymentId },
@@ -1018,36 +1010,34 @@ export const retryPayment = asyncHandler(async (req, res) => {
   const retryOrderId = generateOrderId();
 
   try {
+    const orderData = {
+      amount: parseFloat(payment.amount),
+      currency: "INR",
+      receipt: retryOrderId,
+      notes: {
+        orderId: retryOrderId,
+        userId,
+        originalPaymentId: paymentId,
+        courses: courseIds.join(","),
+      },
+      metadata: {
+        orderId: retryOrderId,
+        userId,
+        originalPaymentId: paymentId,
+        courses: courseIds.join(","),
+      },
+    };
+
+    const gatewayOrder = await paymentService.createOrder(gateway, orderData);
+
     let gatewayOrderId = null;
     let clientSecret = null;
 
     if (gateway === "RAZORPAY") {
-      const razorpayOrder = await razorpay.orders.create({
-        amount: Math.round(parseFloat(payment.amount) * 100),
-        currency: "INR",
-        receipt: retryOrderId,
-        payment_capture: 1,
-        notes: {
-          orderId: retryOrderId,
-          userId,
-          originalPaymentId: paymentId,
-          courses: courseIds.join(","),
-        },
-      });
-      gatewayOrderId = razorpayOrder.id;
+      gatewayOrderId = gatewayOrder.id;
     } else if (gateway === "STRIPE") {
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(parseFloat(payment.amount) * 100),
-        currency: "inr",
-        metadata: {
-          orderId: retryOrderId,
-          userId,
-          originalPaymentId: paymentId,
-          courses: courseIds.join(","),
-        },
-      });
-      gatewayOrderId = paymentIntent.id;
-      clientSecret = paymentIntent.client_secret;
+      gatewayOrderId = gatewayOrder.id;
+      clientSecret = gatewayOrder.client_secret;
     }
 
     const newPayment = await prisma.payment.create({

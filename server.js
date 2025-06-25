@@ -11,7 +11,28 @@ import rateLimit from "express-rate-limit";
 import slowDown from "express-slow-down";
 import socketManager from "./utils/socket-io.js";
 import redisService from "./utils/redis.js";
-import authRoutes from "./routes/auth.route.js";
+import authRoutes from "./routes/common/auth.route.js";
+import notificationRoutes from "./routes/common/notification.route.js";
+import uploadRoutes from "./routes/common/upload.route.js";
+import searchRoutes from "./routes/common/search.route.js";
+import supportRoutes from "./routes/common/ticket.route.js";
+import adminAnalyticsRoutes from "./routes/admin/adminAnalytics.route.js";
+import adminCourseRoutes from "./routes/admin/adminCourse.route.js";
+import adminModerationRoutes from "./routes/admin/adminModeration.route.js";
+import adminPaymentRoutes from "./routes/admin/adminPayment.route.js";
+import adminSystemRoutes from "./routes/admin/adminSystem.route.js";
+import adminUserRoutes from "./routes/admin/adminUser.route.js";
+import instructorContentRoutes from "./routes/instructor/content.route.js";
+import instructorCouponRoutes from "./routes/instructor/coupon.route.js";
+import instructorEarningRoutes from "./routes/instructor/earning.route.js";
+import instructorCommunityRoutes from "./routes/instructor/instructorCommunity.route.js";
+import instructorVerificationRoutes from "./routes/instructor/verification.route.js";
+import studentCartRoutes from "./routes/student/cart.route.js";
+import studentCatalogRoutes from "./routes/student/catalog.route.js";
+import studentCommunityRoutes from "./routes/student/community.route.js";
+import studentLearningRoutes from "./routes/student/learning.route.js";
+import studentPurchaseRoutes from "./routes/student/purchase.route.js";
+import studentWishlistRoutes from "./routes/student/wishlist.route.js";
 import {
   configureMorgan,
   requestIdMiddleware,
@@ -25,10 +46,6 @@ import {
   authErrorHandler,
 } from "./middlewares/errorHandler.js";
 import "./utils/passport.js";
-import notificationRoutes from "./routes/notification.route.js";
-import uploadRoutes from "./routes/upload.route.js";
-import searchRoutes from "./routes/search.route.js";
-import supportRoutes from "./routes/ticket.route.js";
 config();
 
 const corsOptions = {
@@ -101,16 +118,13 @@ app.use(
 
 app.use(compression());
 
-// Add request ID middleware BEFORE Morgan
 app.use(requestIdMiddleware);
 
-// Configure Morgan logging properly
 configureMorgan(app);
 
-// Fixed global rate limit with proper error handling
 const globalRateLimit = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000, // Max 1000 requests per window
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
 
   message: {
     success: false,
@@ -150,10 +164,9 @@ const globalRateLimit = rateLimit({
   },
 });
 
-// Fixed auth rate limit with enhanced security logging
 const authRateLimit = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 20, // Max 20 auth attempts per window
+  windowMs: 15 * 60 * 1000,
+  max: 20,
 
   message: {
     success: false,
@@ -194,12 +207,11 @@ const authRateLimit = rateLimit({
   },
 });
 
-// Fixed express-slow-down configuration
 const apiSlowDown = slowDown({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  delayAfter: 100, // Start slowing after 100 requests
-  delayMs: () => 500, // Add 500ms delay per request after limit
-  maxDelayMs: 20000, // Maximum 20 second delay
+  windowMs: 15 * 60 * 1000,
+  delayAfter: 100,
+  delayMs: () => 500,
+  maxDelayMs: 20000,
 });
 
 app.use(cors(corsOptions));
@@ -257,10 +269,8 @@ app.use(
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Add user ID middleware AFTER auth middleware
 app.use(userIdMiddleware);
 
-// Apply rate limiting and slow down middleware
 app.use(globalRateLimit);
 app.use(apiSlowDown);
 
@@ -317,13 +327,36 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// Routes with authentication middleware
 app.use("/api/auth", authRateLimit, authRoutes);
 app.use("/api/notifications", authRateLimit, notificationRoutes);
 app.use("/api/upload", authRateLimit, uploadRoutes);
 app.use("/api/search", authRateLimit, searchRoutes);
 app.use("/api/support", authRateLimit, supportRoutes);
-// Payment webhook endpoint
+
+app.use("/api/admin/analytics", authRateLimit, adminAnalyticsRoutes);
+app.use("/api/admin/courses", authRateLimit, adminCourseRoutes);
+app.use("/api/admin/moderation", authRateLimit, adminModerationRoutes);
+app.use("/api/admin/payments", authRateLimit, adminPaymentRoutes);
+app.use("/api/admin/system", authRateLimit, adminSystemRoutes);
+app.use("/api/admin/users", authRateLimit, adminUserRoutes);
+
+app.use("/api/instructor/content", authRateLimit, instructorContentRoutes);
+app.use("/api/instructor/coupons", authRateLimit, instructorCouponRoutes);
+app.use("/api/instructor/earnings", authRateLimit, instructorEarningRoutes);
+app.use("/api/instructor/community", authRateLimit, instructorCommunityRoutes);
+app.use(
+  "/api/instructor/verification",
+  authRateLimit,
+  instructorVerificationRoutes
+);
+
+app.use("/api/student/cart", authRateLimit, studentCartRoutes);
+app.use("/api/student/catalog", authRateLimit, studentCatalogRoutes);
+app.use("/api/student/community", authRateLimit, studentCommunityRoutes);
+app.use("/api/student/learning", authRateLimit, studentLearningRoutes);
+app.use("/api/student/purchase", authRateLimit, studentPurchaseRoutes);
+app.use("/api/student/wishlist", authRateLimit, studentWishlistRoutes);
+
 app.post(
   "/api/webhook/payment",
   express.raw({ type: "application/json" }),
@@ -366,14 +399,12 @@ app.post(
   }
 );
 
-// Middleware to attach services to request object
 app.use((req, res, next) => {
   req.redisService = redisService;
   req.socketManager = socketManager;
   next();
 });
 
-// Additional security headers
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -382,14 +413,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Error handling middleware
 app.use(validationErrorHandler);
 app.use(databaseErrorHandler);
 app.use(authErrorHandler);
 app.use(notFound);
 app.use(errorHandler);
 
-// Graceful shutdown handling
 const gracefulShutdown = (signal) => {
   console.log(`🛑 ${signal} received, shutting down gracefully`);
   console.log(`⏱️  Uptime: ${process.uptime()}s`);
@@ -426,7 +455,6 @@ const gracefulShutdown = (signal) => {
   }, 30000);
 };
 
-// Process event handlers
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
@@ -454,7 +482,6 @@ process.on("exit", (code) => {
   console.log(`🏁 Process exited with code: ${code}`);
 });
 
-// Memory monitoring
 const memoryUsageInterval = setInterval(() => {
   const used = process.memoryUsage();
   const memoryUsageMB = Math.round(used.heapUsed / 1024 / 1024);
@@ -468,7 +495,6 @@ const memoryUsageInterval = setInterval(() => {
   }
 }, 300000);
 
-// Health check monitoring
 const healthCheckInterval = setInterval(async () => {
   try {
     await redisService.healthCheck();
@@ -482,7 +508,6 @@ const healthCheckInterval = setInterval(async () => {
   }
 }, 60000);
 
-// Start server
 server.listen(PORT, () => {
   console.log(`🚀 Educademy Server running on port ${PORT}`);
   console.log(`🕐 Started at: ${new Date().toISOString()}`);
@@ -511,7 +536,6 @@ server.listen(PORT, () => {
   }
 });
 
-// Cleanup intervals on exit
 process.on("beforeExit", () => {
   clearInterval(memoryUsageInterval);
   clearInterval(healthCheckInterval);

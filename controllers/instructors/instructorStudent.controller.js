@@ -1,8 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 import asyncHandler from "express-async-handler";
-import redisService from "../utils/redis.js";
-import emailService from "../utils/emailService.js";
-import socketManager from "../utils/socket-io.js";
+import redisService from "../../utils/redis.js";
+import emailService from "../../utils/emailService.js";
+import socketManager from "../../utils/socket-io.js";
 
 const prisma = new PrismaClient();
 

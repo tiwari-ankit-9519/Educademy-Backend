@@ -1,22 +1,19 @@
 import { PrismaClient } from "@prisma/client";
 import asyncHandler from "express-async-handler";
-import redisService from "../utils/redis.js";
-import emailService from "../utils/emailService.js";
-import notificationService from "../utils/notificationservice.js";
+import redisService from "../../utils/redis.js";
+import emailService from "../../utils/emailService.js";
+import notificationService from "../../utils/notificationservice.js";
 import { Decimal } from "@prisma/client/runtime/library.js";
 import {
-  calculateCommission,
   calculateGrowthRate,
   formatCurrency,
   generateEarningsCSV,
   validateMinPayoutAmount,
   generatePayoutReference,
   getEarningsMetrics,
-  calculateTaxes,
-  convertCurrency,
   generateTaxDocument,
   schedulePayoutReminder,
-} from "../utils/earningsUtils.js";
+} from "../../helper/payoutHelperFunctions.js";
 
 const prisma = new PrismaClient();
 

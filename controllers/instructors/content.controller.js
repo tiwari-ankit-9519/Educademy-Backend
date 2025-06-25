@@ -1,6 +1,6 @@
 import { PrismaClient } from "@prisma/client";
 import asyncHandler from "express-async-handler";
-import redisService from "../utils/redis.js";
+import redisService from "../../utils/redis.js";
 import { v2 as cloudinary } from "cloudinary";
 
 const prisma = new PrismaClient();

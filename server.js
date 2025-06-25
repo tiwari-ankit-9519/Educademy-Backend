@@ -27,6 +27,8 @@ import instructorCouponRoutes from "./routes/instructor/coupon.route.js";
 import instructorEarningRoutes from "./routes/instructor/earning.route.js";
 import instructorCommunityRoutes from "./routes/instructor/instructorCommunity.route.js";
 import instructorVerificationRoutes from "./routes/instructor/verification.route.js";
+import instructorCourseRoutes from "./routes/instructor/instructorCourse.route.js";
+import instructorStudentRoutes from "./routes/instructor/instructorStudent.route.js";
 import studentCartRoutes from "./routes/student/cart.route.js";
 import studentCatalogRoutes from "./routes/student/catalog.route.js";
 import studentCommunityRoutes from "./routes/student/community.route.js";
@@ -349,6 +351,8 @@ app.use(
   authRateLimit,
   instructorVerificationRoutes
 );
+app.use("/api/instructor/courses", authRateLimit, instructorCourseRoutes);
+app.use("/api/instructor/students", authRateLimit, instructorStudentRoutes);
 
 app.use("/api/student/cart", authRateLimit, studentCartRoutes);
 app.use("/api/student/catalog", authRateLimit, studentCatalogRoutes);

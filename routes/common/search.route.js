@@ -9,7 +9,7 @@ import {
   clearSearchHistory,
   getPopularSearches,
   getSearchFilters,
-} from "../controllers/search.controller.js";
+} from "../../controllers/common/search.controller.js";
 
 const router = express.Router();
 

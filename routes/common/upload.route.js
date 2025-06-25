@@ -10,7 +10,7 @@ import {
   deleteUploadedFile,
   getUploadLimitsInfo,
   getUploadStats,
-} from "../controllers/upload.controller.js";
+} from "../../controllers/common/upload.controller.js";
 
 const router = express.Router();
 

@@ -11,7 +11,7 @@ import {
   updateNotificationSettings,
   sendTestNotification,
   getNotificationPreferences,
-} from "../controllers/notification.controller.js";
+} from "../../controllers/common/notification.controller.js";
 
 const router = express.Router();
 

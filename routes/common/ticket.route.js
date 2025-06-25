@@ -8,7 +8,7 @@ import {
   updateTicketStatus,
   getSupportCategories,
   getSupportStats,
-} from "../controllers/ticket.controller.js";
+} from "../../controllers/common/ticket.controller.js";
 
 const router = express.Router();
 

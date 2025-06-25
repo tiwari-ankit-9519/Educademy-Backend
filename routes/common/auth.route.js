@@ -23,7 +23,7 @@ import {
   checkReactivationStatus,
   getAccountSummary,
   deleteAccount,
-} from "../controllers/auth.controller.js";
+} from "../../controllers/common/auth.controller.js";
 import { isLoggedIn } from "../../middlewares/middleware.js";
 
 const router = Router();

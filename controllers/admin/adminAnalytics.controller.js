@@ -4,36 +4,50 @@ import redisService from "../../utils/redis.js";
 
 const prisma = new PrismaClient();
 
-const generateAnalyticsId = () => {
-  return `analytics_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+const getDateRange = (period) => {
+  const now = new Date();
+  let fromDate;
+
+  switch (period) {
+    case "7d":
+      fromDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      break;
+    case "30d":
+      fromDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      break;
+    case "90d":
+      fromDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+      break;
+    case "1y":
+      fromDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+      break;
+    default:
+      fromDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  }
+
+  return fromDate;
 };
 
 const calculateGrowthRate = (current, previous) => {
-  if (previous === 0) return current > 0 ? 100 : 0;
-  return (((current - previous) / previous) * 100).toFixed(2);
+  if (previous === 0) {
+    return current > 0 ? 100 : 0;
+  }
+  return ((current - previous) / previous) * 100;
 };
 
-const getDateRange = (period) => {
-  const now = new Date();
-  const ranges = {
-    "7d": new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000),
-    "30d": new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
-    "90d": new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000),
-    "1y": new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000),
-    all: new Date("2020-01-01"),
-  };
-  return ranges[period] || ranges["30d"];
+const generateAnalyticsId = () => {
+  return `analytics_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 };
 
 export const getDashboardOverview = asyncHandler(async (req, res) => {
   const startTime = performance.now();
 
   try {
-    const { period = "30d", refresh = false } = req.query;
+    const { period = "30d", refresh = "false" } = req.query;
 
-    const cacheKey = `admin_dashboard_overview:${period}`;
+    const cacheKey = `dashboard_overview:${period}`;
 
-    if (!refresh) {
+    if (refresh !== "true") {
       const cachedData = await redisService.getJSON(cacheKey);
       if (cachedData) {
         return res.status(200).json({
@@ -50,46 +64,52 @@ export const getDashboardOverview = asyncHandler(async (req, res) => {
     }
 
     const fromDate = getDateRange(period);
-    const previousPeriodStart = new Date(
-      fromDate.getTime() - (Date.now() - fromDate.getTime())
-    );
 
     const [
       totalUsers,
       totalCourses,
       totalRevenue,
       totalEnrollments,
-      recentUsers,
-      recentCourses,
-      recentRevenue,
-      recentEnrollments,
-      previousUsers,
-      previousCourses,
-      previousRevenue,
-      previousEnrollments,
       activeUsers,
-      publishedCourses,
-      pendingCourses,
-      verifiedInstructors,
-      totalInstructors,
-      avgCourseRating,
-      totalReviews,
-      supportTickets,
+      recentSignups,
+      coursesThisPeriod,
+      revenueThisPeriod,
+      enrollmentsThisPeriod,
+      topCourses,
+      recentActivity,
     ] = await Promise.all([
       prisma.user.count(),
-      prisma.course.count(),
+
+      prisma.course.count({
+        where: { status: "PUBLISHED" },
+      }),
+
       prisma.payment.aggregate({
         _sum: { amount: true },
         where: { status: "COMPLETED" },
       }),
+
       prisma.enrollment.count(),
+
+      prisma.user.count({
+        where: {
+          lastLogin: {
+            gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+          },
+        },
+      }),
 
       prisma.user.count({
         where: { createdAt: { gte: fromDate } },
       }),
+
       prisma.course.count({
-        where: { createdAt: { gte: fromDate } },
+        where: {
+          createdAt: { gte: fromDate },
+          status: "PUBLISHED",
+        },
       }),
+
       prisma.payment.aggregate({
         _sum: { amount: true },
         where: {
@@ -97,127 +117,80 @@ export const getDashboardOverview = asyncHandler(async (req, res) => {
           createdAt: { gte: fromDate },
         },
       }),
+
       prisma.enrollment.count({
         where: { createdAt: { gte: fromDate } },
       }),
 
-      prisma.user.count({
-        where: {
-          createdAt: {
-            gte: previousPeriodStart,
-            lt: fromDate,
+      prisma.course.findMany({
+        select: {
+          id: true,
+          title: true,
+          totalEnrollments: true,
+          averageRating: true,
+          instructor: {
+            select: {
+              user: {
+                select: {
+                  firstName: true,
+                  lastName: true,
+                },
+              },
+            },
           },
         },
-      }),
-      prisma.course.count({
-        where: {
-          createdAt: {
-            gte: previousPeriodStart,
-            lt: fromDate,
-          },
-        },
-      }),
-      prisma.payment.aggregate({
-        _sum: { amount: true },
-        where: {
-          status: "COMPLETED",
-          createdAt: {
-            gte: previousPeriodStart,
-            lt: fromDate,
-          },
-        },
-      }),
-      prisma.enrollment.count({
-        where: {
-          createdAt: {
-            gte: previousPeriodStart,
-            lt: fromDate,
-          },
-        },
+        where: { status: "PUBLISHED" },
+        orderBy: { totalEnrollments: "desc" },
+        take: 5,
       }),
 
-      prisma.user.count({
-        where: {
-          isActive: true,
-          lastLogin: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
-        },
-      }),
-      prisma.course.count({
-        where: { status: "PUBLISHED" },
-      }),
-      prisma.course.count({
-        where: { status: "UNDER_REVIEW" },
-      }),
-      prisma.instructor.count({
-        where: { isVerified: true },
-      }),
-      prisma.instructor.count(),
-      prisma.course.aggregate({
-        _avg: { averageRating: true },
-        where: { status: "PUBLISHED" },
-      }),
-      prisma.review.count(),
-      prisma.supportTicket.count({
-        where: { status: { in: ["OPEN", "IN_PROGRESS"] } },
-      }),
+      prisma.userActivity
+        .findMany({
+          select: {
+            action: true,
+            createdAt: true,
+            user: {
+              select: {
+                firstName: true,
+                lastName: true,
+              },
+            },
+          },
+          where: {
+            createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+          },
+          orderBy: { createdAt: "desc" },
+          take: 10,
+        })
+        .catch(() => []),
     ]);
 
     const overview = {
-      users: {
-        total: totalUsers,
-        recent: recentUsers,
-        active: activeUsers,
-        growth: calculateGrowthRate(recentUsers, previousUsers),
-        activePercentage:
-          totalUsers > 0 ? ((activeUsers / totalUsers) * 100).toFixed(1) : 0,
+      summary: {
+        totalUsers,
+        totalCourses,
+        totalRevenue: Number(totalRevenue._sum?.amount || 0),
+        totalEnrollments,
+        activeUsers,
       },
-      courses: {
-        total: totalCourses,
-        recent: recentCourses,
-        published: publishedCourses,
-        pending: pendingCourses,
-        growth: calculateGrowthRate(recentCourses, previousCourses),
-        publishedPercentage:
-          totalCourses > 0
-            ? ((publishedCourses / totalCourses) * 100).toFixed(1)
-            : 0,
+      growth: {
+        newUsers: recentSignups,
+        newCourses: coursesThisPeriod,
+        newRevenue: Number(revenueThisPeriod._sum?.amount || 0),
+        newEnrollments: enrollmentsThisPeriod,
       },
-      revenue: {
-        total: Number(totalRevenue._sum?.amount || 0),
-        recent: Number(recentRevenue._sum?.amount || 0),
-        growth: calculateGrowthRate(
-          Number(recentRevenue._sum?.amount || 0),
-          Number(previousRevenue._sum?.amount || 0)
-        ),
-        averagePerUser:
-          totalUsers > 0
-            ? (Number(totalRevenue._sum?.amount || 0) / totalUsers).toFixed(2)
-            : 0,
-      },
-      enrollments: {
-        total: totalEnrollments,
-        recent: recentEnrollments,
-        growth: calculateGrowthRate(recentEnrollments, previousEnrollments),
-        averagePerCourse:
-          publishedCourses > 0
-            ? (totalEnrollments / publishedCourses).toFixed(1)
-            : 0,
-      },
-      instructors: {
-        total: totalInstructors,
-        verified: verifiedInstructors,
-        verificationRate:
-          totalInstructors > 0
-            ? ((verifiedInstructors / totalInstructors) * 100).toFixed(1)
-            : 0,
-      },
-      quality: {
-        averageRating: Number(avgCourseRating._avg?.averageRating || 0).toFixed(
-          1
-        ),
-        totalReviews,
-        pendingSupport: supportTickets,
-      },
+      topCourses: topCourses.map((course) => ({
+        id: course.id,
+        title: course.title,
+        enrollments: course.totalEnrollments,
+        rating: Number(course.averageRating || 0).toFixed(1),
+        instructor: `${course.instructor.user.firstName} ${course.instructor.user.lastName}`,
+      })),
+      recentActivity: recentActivity.map((activity) => ({
+        action: activity.action,
+        user: `${activity.user.firstName} ${activity.user.lastName}`,
+        timestamp: activity.createdAt,
+      })),
       period,
       lastUpdated: new Date().toISOString(),
     };
@@ -274,6 +247,80 @@ export const getUserAnalytics = asyncHandler(async (req, res) => {
 
     const fromDate = getDateRange(period);
 
+    // Validate and sanitize groupBy parameter
+    const validGroupBy = ["day", "week", "month", "year"].includes(groupBy)
+      ? groupBy
+      : "day";
+
+    // Create the raw query based on groupBy parameter
+    let userGrowthQuery;
+    switch (validGroupBy) {
+      case "day":
+        userGrowthQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('day', "createdAt") as date,
+            COUNT(*)::int as count,
+            COUNT(CASE WHEN role = 'STUDENT' THEN 1 END)::int as students,
+            COUNT(CASE WHEN role = 'INSTRUCTOR' THEN 1 END)::int as instructors
+          FROM "User"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('day', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "week":
+        userGrowthQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('week', "createdAt") as date,
+            COUNT(*)::int as count,
+            COUNT(CASE WHEN role = 'STUDENT' THEN 1 END)::int as students,
+            COUNT(CASE WHEN role = 'INSTRUCTOR' THEN 1 END)::int as instructors
+          FROM "User"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('week', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "month":
+        userGrowthQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('month', "createdAt") as date,
+            COUNT(*)::int as count,
+            COUNT(CASE WHEN role = 'STUDENT' THEN 1 END)::int as students,
+            COUNT(CASE WHEN role = 'INSTRUCTOR' THEN 1 END)::int as instructors
+          FROM "User"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('month', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "year":
+        userGrowthQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('year', "createdAt") as date,
+            COUNT(*)::int as count,
+            COUNT(CASE WHEN role = 'STUDENT' THEN 1 END)::int as students,
+            COUNT(CASE WHEN role = 'INSTRUCTOR' THEN 1 END)::int as instructors
+          FROM "User"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('year', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      default:
+        userGrowthQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('day', "createdAt") as date,
+            COUNT(*)::int as count,
+            COUNT(CASE WHEN role = 'STUDENT' THEN 1 END)::int as students,
+            COUNT(CASE WHEN role = 'INSTRUCTOR' THEN 1 END)::int as instructors
+          FROM "User"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('day', "createdAt")
+          ORDER BY date
+        `;
+    }
+
     const [
       userGrowth,
       usersByRole,
@@ -283,17 +330,7 @@ export const getUserAnalytics = asyncHandler(async (req, res) => {
       retentionStats,
       engagementStats,
     ] = await Promise.all([
-      prisma.$queryRaw`
-        SELECT 
-          DATE_TRUNC(${groupBy}, "createdAt") as date,
-          COUNT(*) as count,
-          COUNT(CASE WHEN role = 'STUDENT' THEN 1 END) as students,
-          COUNT(CASE WHEN role = 'INSTRUCTOR' THEN 1 END) as instructors
-        FROM "User"
-        WHERE "createdAt" >= ${fromDate}
-        GROUP BY DATE_TRUNC(${groupBy}, "createdAt")
-        ORDER BY date
-      `,
+      userGrowthQuery,
 
       prisma.user.groupBy({
         by: ["role"],
@@ -317,11 +354,17 @@ export const getUserAnalytics = asyncHandler(async (req, res) => {
         take: 10,
       }),
 
-      prisma.session.groupBy({
-        by: ["deviceType"],
-        _count: { deviceType: true },
-        where: { createdAt: { gte: fromDate } },
-      }),
+      // Handle optional session table
+      prisma.session
+        .groupBy({
+          by: ["deviceType"],
+          _count: { deviceType: true },
+          where: { createdAt: { gte: fromDate } },
+        })
+        .catch(() => {
+          console.warn("Session table not found or deviceType column missing");
+          return [];
+        }),
 
       prisma.user.findMany({
         select: {
@@ -332,15 +375,22 @@ export const getUserAnalytics = asyncHandler(async (req, res) => {
         where: { createdAt: { gte: fromDate } },
       }),
 
-      prisma.userActivity.groupBy({
-        by: ["action"],
-        _count: { action: true },
-        where: { createdAt: { gte: fromDate } },
-        orderBy: { _count: { action: "desc" } },
-        take: 10,
-      }),
+      // Handle optional userActivity table
+      prisma.userActivity
+        .groupBy({
+          by: ["action"],
+          _count: { action: true },
+          where: { createdAt: { gte: fromDate } },
+          orderBy: { _count: { action: "desc" } },
+          take: 10,
+        })
+        .catch(() => {
+          console.warn("UserActivity table not found");
+          return [];
+        }),
     ]);
 
+    // Calculate retention metrics
     const now = new Date();
     const retention = {
       day1: 0,
@@ -386,31 +436,49 @@ export const getUserAnalytics = asyncHandler(async (req, res) => {
         })),
       },
       devices: deviceStats.map((item) => ({
-        type: item.deviceType,
+        type: item.deviceType || "unknown",
         count: item._count.deviceType,
       })),
       retention: {
         day1Retention:
           retentionStats.length > 0
             ? ((retention.day1 / retentionStats.length) * 100).toFixed(2)
-            : 0,
+            : "0",
         day7Retention:
           retentionStats.length > 0
             ? ((retention.day7 / retentionStats.length) * 100).toFixed(2)
-            : 0,
+            : "0",
         day30Retention:
           retentionStats.length > 0
             ? ((retention.day30 / retentionStats.length) * 100).toFixed(2)
-            : 0,
+            : "0",
       },
       engagement: engagementStats.map((item) => ({
         action: item.action,
         count: item._count.action,
       })),
+      summary: {
+        totalUsers: usersByRole.reduce(
+          (sum, item) => sum + item._count.role,
+          0
+        ),
+        activeUsers:
+          usersByStatus.find((item) => item.isActive)?._count.isActive || 0,
+        inactiveUsers:
+          usersByStatus.find((item) => !item.isActive)?._count.isActive || 0,
+        studentsCount:
+          usersByRole.find((item) => item.role === "STUDENT")?._count.role || 0,
+        instructorsCount:
+          usersByRole.find((item) => item.role === "INSTRUCTOR")?._count.role ||
+          0,
+        topCountry: topCountries[0]?.country || "Unknown",
+      },
       period,
+      groupBy: validGroupBy,
       lastUpdated: new Date().toISOString(),
     };
 
+    // Cache the result
     await redisService.setJSON(cacheKey, analytics, { ex: 3600 });
 
     const executionTime = Math.round(performance.now() - startTime);
@@ -427,9 +495,44 @@ export const getUserAnalytics = asyncHandler(async (req, res) => {
     });
   } catch (error) {
     console.error("User analytics error:", error);
+
+    // Provide fallback data in case of error
+    const fallbackData = {
+      growth: [],
+      demographics: {
+        byRole: [],
+        byStatus: [],
+        byCountry: [],
+      },
+      devices: [],
+      retention: {
+        day1Retention: "0",
+        day7Retention: "0",
+        day30Retention: "0",
+      },
+      engagement: [],
+      summary: {
+        totalUsers: 0,
+        activeUsers: 0,
+        inactiveUsers: 0,
+        studentsCount: 0,
+        instructorsCount: 0,
+        topCountry: "Unknown",
+      },
+      period: req.query.period || "30d",
+      groupBy: req.query.groupBy || "day",
+      lastUpdated: new Date().toISOString(),
+      error: true,
+    };
+
     res.status(500).json({
       success: false,
       message: "Failed to retrieve user analytics",
+      data: fallbackData,
+      error:
+        process.env.NODE_ENV === "development"
+          ? error.message
+          : "Internal server error",
       code: "INTERNAL_SERVER_ERROR",
       meta: {
         executionTime: Math.round(performance.now() - startTime),
@@ -463,6 +566,136 @@ export const getCourseAnalytics = asyncHandler(async (req, res) => {
 
     const fromDate = getDateRange(period);
 
+    const validGroupBy = ["day", "week", "month", "year"].includes(groupBy)
+      ? groupBy
+      : "day";
+
+    let courseCreationQuery;
+    switch (validGroupBy) {
+      case "day":
+        courseCreationQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('day', "createdAt") as date,
+            COUNT(*) as total,
+            COUNT(CASE WHEN status = 'PUBLISHED' THEN 1 END) as published,
+            COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) as drafts
+          FROM "Course"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('day', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "week":
+        courseCreationQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('week', "createdAt") as date,
+            COUNT(*) as total,
+            COUNT(CASE WHEN status = 'PUBLISHED' THEN 1 END) as published,
+            COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) as drafts
+          FROM "Course"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('week', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "month":
+        courseCreationQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('month', "createdAt") as date,
+            COUNT(*) as total,
+            COUNT(CASE WHEN status = 'PUBLISHED' THEN 1 END) as published,
+            COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) as drafts
+          FROM "Course"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('month', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "year":
+        courseCreationQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('year', "createdAt") as date,
+            COUNT(*) as total,
+            COUNT(CASE WHEN status = 'PUBLISHED' THEN 1 END) as published,
+            COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) as drafts
+          FROM "Course"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('year', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      default:
+        courseCreationQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('day', "createdAt") as date,
+            COUNT(*) as total,
+            COUNT(CASE WHEN status = 'PUBLISHED' THEN 1 END) as published,
+            COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) as drafts
+          FROM "Course"
+          WHERE "createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('day', "createdAt")
+          ORDER BY date
+        `;
+    }
+
+    let enrollmentTrendsQuery;
+    switch (validGroupBy) {
+      case "day":
+        enrollmentTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('day', e."createdAt") as date,
+            COUNT(*) as enrollments
+          FROM "Enrollment" e
+          WHERE e."createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('day', e."createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "week":
+        enrollmentTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('week', e."createdAt") as date,
+            COUNT(*) as enrollments
+          FROM "Enrollment" e
+          WHERE e."createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('week', e."createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "month":
+        enrollmentTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('month', e."createdAt") as date,
+            COUNT(*) as enrollments
+          FROM "Enrollment" e
+          WHERE e."createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('month', e."createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "year":
+        enrollmentTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('year', e."createdAt") as date,
+            COUNT(*) as enrollments
+          FROM "Enrollment" e
+          WHERE e."createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('year', e."createdAt")
+          ORDER BY date
+        `;
+        break;
+      default:
+        enrollmentTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('day', e."createdAt") as date,
+            COUNT(*) as enrollments
+          FROM "Enrollment" e
+          WHERE e."createdAt" >= ${fromDate}
+          GROUP BY DATE_TRUNC('day', e."createdAt")
+          ORDER BY date
+        `;
+    }
+
     const [
       courseCreation,
       coursesByCategory,
@@ -475,17 +708,7 @@ export const getCourseAnalytics = asyncHandler(async (req, res) => {
       completionRates,
       ratingDistribution,
     ] = await Promise.all([
-      prisma.$queryRaw`
-        SELECT 
-          DATE_TRUNC(${groupBy}, "createdAt") as date,
-          COUNT(*) as total,
-          COUNT(CASE WHEN status = 'PUBLISHED' THEN 1 END) as published,
-          COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) as drafts
-        FROM "Course"
-        WHERE "createdAt" >= ${fromDate}
-        GROUP BY DATE_TRUNC(${groupBy}, "createdAt")
-        ORDER BY date
-      `,
+      courseCreationQuery,
 
       prisma.course.groupBy({
         by: ["categoryId"],
@@ -544,15 +767,7 @@ export const getCourseAnalytics = asyncHandler(async (req, res) => {
         },
       }),
 
-      prisma.$queryRaw`
-        SELECT 
-          DATE_TRUNC(${groupBy}, e."createdAt") as date,
-          COUNT(*) as enrollments
-        FROM "Enrollment" e
-        WHERE e."createdAt" >= ${fromDate}
-        GROUP BY DATE_TRUNC(${groupBy}, e."createdAt")
-        ORDER BY date
-      `,
+      enrollmentTrendsQuery,
 
       prisma.course.findMany({
         select: {
@@ -686,6 +901,7 @@ export const getCourseAnalytics = asyncHandler(async (req, res) => {
         }, {}),
       },
       period,
+      groupBy: validGroupBy,
       lastUpdated: new Date().toISOString(),
     };
 
@@ -741,6 +957,88 @@ export const getRevenueAnalytics = asyncHandler(async (req, res) => {
 
     const fromDate = getDateRange(period);
 
+    const validGroupBy = ["day", "week", "month", "year"].includes(groupBy)
+      ? groupBy
+      : "day";
+
+    let revenueTrendsQuery;
+    switch (validGroupBy) {
+      case "day":
+        revenueTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('day', "createdAt") as date,
+            SUM(amount) as revenue,
+            COUNT(*) as transactions,
+            AVG(amount) as avg_transaction
+          FROM "Payment"
+          WHERE "createdAt" >= ${fromDate} 
+          AND status = 'COMPLETED'
+          AND currency = ${currency}
+          GROUP BY DATE_TRUNC('day', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "week":
+        revenueTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('week', "createdAt") as date,
+            SUM(amount) as revenue,
+            COUNT(*) as transactions,
+            AVG(amount) as avg_transaction
+          FROM "Payment"
+          WHERE "createdAt" >= ${fromDate} 
+          AND status = 'COMPLETED'
+          AND currency = ${currency}
+          GROUP BY DATE_TRUNC('week', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "month":
+        revenueTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('month', "createdAt") as date,
+            SUM(amount) as revenue,
+            COUNT(*) as transactions,
+            AVG(amount) as avg_transaction
+          FROM "Payment"
+          WHERE "createdAt" >= ${fromDate} 
+          AND status = 'COMPLETED'
+          AND currency = ${currency}
+          GROUP BY DATE_TRUNC('month', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      case "year":
+        revenueTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('year', "createdAt") as date,
+            SUM(amount) as revenue,
+            COUNT(*) as transactions,
+            AVG(amount) as avg_transaction
+          FROM "Payment"
+          WHERE "createdAt" >= ${fromDate} 
+          AND status = 'COMPLETED'
+          AND currency = ${currency}
+          GROUP BY DATE_TRUNC('year', "createdAt")
+          ORDER BY date
+        `;
+        break;
+      default:
+        revenueTrendsQuery = prisma.$queryRaw`
+          SELECT 
+            DATE_TRUNC('day', "createdAt") as date,
+            SUM(amount) as revenue,
+            COUNT(*) as transactions,
+            AVG(amount) as avg_transaction
+          FROM "Payment"
+          WHERE "createdAt" >= ${fromDate} 
+          AND status = 'COMPLETED'
+          AND currency = ${currency}
+          GROUP BY DATE_TRUNC('day', "createdAt")
+          ORDER BY date
+        `;
+    }
+
     const [
       revenueTrends,
       revenueByMethod,
@@ -751,19 +1049,7 @@ export const getRevenueAnalytics = asyncHandler(async (req, res) => {
       conversionFunnel,
       transactionStats,
     ] = await Promise.all([
-      prisma.$queryRaw`
-        SELECT 
-          DATE_TRUNC(${groupBy}, "createdAt") as date,
-          SUM(amount) as revenue,
-          COUNT(*) as transactions,
-          AVG(amount) as avg_transaction
-        FROM "Payment"
-        WHERE "createdAt" >= ${fromDate} 
-        AND status = 'COMPLETED'
-        AND currency = ${currency}
-        GROUP BY DATE_TRUNC(${groupBy}, "createdAt")
-        ORDER BY date
-      `,
+      revenueTrendsQuery,
 
       prisma.payment.groupBy({
         by: ["method"],
@@ -825,16 +1111,16 @@ export const getRevenueAnalytics = asyncHandler(async (req, res) => {
 
       prisma.$queryRaw`
         SELECT 
-          EXTRACT(MONTH FROM "createdAt") as month,
-          EXTRACT(YEAR FROM "createdAt") as year,
+          EXTRACT(MONTH FROM p."createdAt") as month,
+          EXTRACT(YEAR FROM p."createdAt") as year,
           SUM(amount) as revenue,
-          COUNT(DISTINCT "courseId") as unique_courses
+          COUNT(DISTINCT e."courseId") as unique_courses
         FROM "Payment" p
         JOIN "Enrollment" e ON p.id = e."paymentId"
         WHERE p.status = 'COMPLETED' 
         AND p.currency = ${currency}
         AND p."createdAt" >= ${fromDate}
-        GROUP BY EXTRACT(YEAR FROM "createdAt"), EXTRACT(MONTH FROM "createdAt")
+        GROUP BY EXTRACT(YEAR FROM p."createdAt"), EXTRACT(MONTH FROM p."createdAt")
         ORDER BY year, month
       `,
 
@@ -950,6 +1236,7 @@ export const getRevenueAnalytics = asyncHandler(async (req, res) => {
       }, {}),
       currency,
       period,
+      groupBy: validGroupBy,
       lastUpdated: new Date().toISOString(),
     };
 
@@ -1046,82 +1333,102 @@ export const getEngagementAnalytics = asyncHandler(async (req, res) => {
       completionStats,
       socialActivity,
     ] = await Promise.all([
-      prisma.session.count({
-        where: { createdAt: { gte: fromDate } },
-      }),
+      prisma.session
+        .count({
+          where: { createdAt: { gte: fromDate } },
+        })
+        .catch(() => 0),
 
-      prisma.session.aggregate({
-        _avg: { sessionDuration: true },
-        where: {
-          createdAt: { gte: fromDate },
-          sessionDuration: { not: null },
-        },
-      }),
-
-      prisma.userActivity.count({
-        where: {
-          action: "page_view",
-          createdAt: { gte: fromDate },
-        },
-      }),
-
-      prisma.userActivity.groupBy({
-        by: ["page"],
-        _count: { page: true },
-        where: {
-          action: "page_view",
-          createdAt: { gte: fromDate },
-          page: { not: null },
-        },
-        orderBy: { _count: { page: "desc" } },
-        take: 10,
-      }),
-
-      prisma.session.groupBy({
-        by: ["deviceType"],
-        _count: { deviceType: true },
-        where: { createdAt: { gte: fromDate } },
-      }),
-
-      prisma.session.groupBy({
-        by: ["browser"],
-        _count: { browser: true },
-        where: {
-          createdAt: { gte: fromDate },
-          browser: { not: null },
-        },
-      }),
-
-      prisma.lessonCompletion.count({
-        where: { completedAt: { gte: fromDate } },
-      }),
-
-      prisma.userActivity.groupBy({
-        by: ["action"],
-        _count: { action: true },
-        where: {
-          createdAt: { gte: fromDate },
-          action: {
-            in: [
-              "video_play",
-              "video_pause",
-              "quiz_start",
-              "quiz_complete",
-              "download",
-              "bookmark",
-            ],
+      prisma.session
+        .aggregate({
+          _avg: { sessionDuration: true },
+          where: {
+            createdAt: { gte: fromDate },
+            sessionDuration: { not: null },
           },
-        },
-      }),
+        })
+        .catch(() => ({ _avg: { sessionDuration: 0 } })),
 
-      prisma.enrollment.aggregate({
-        _avg: { progress: true },
-        where: { createdAt: { gte: fromDate } },
-      }),
+      prisma.userActivity
+        .count({
+          where: {
+            action: "page_view",
+            createdAt: { gte: fromDate },
+          },
+        })
+        .catch(() => 0),
 
-      prisma.review.count({
-        where: { createdAt: { gte: fromDate } },
-      }),
+      prisma.userActivity
+        .groupBy({
+          by: ["page"],
+          _count: { page: true },
+          where: {
+            action: "page_view",
+            createdAt: { gte: fromDate },
+            page: { not: null },
+          },
+          orderBy: { _count: { page: "desc" } },
+          take: 10,
+        })
+        .catch(() => []),
+
+      prisma.session
+        .groupBy({
+          by: ["deviceType"],
+          _count: { deviceType: true },
+          where: { createdAt: { gte: fromDate } },
+        })
+        .catch(() => []),
+
+      prisma.session
+        .groupBy({
+          by: ["browser"],
+          _count: { browser: true },
+          where: {
+            createdAt: { gte: fromDate },
+            browser: { not: null },
+          },
+        })
+        .catch(() => []),
+
+      prisma.lessonCompletion
+        .count({
+          where: { completedAt: { gte: fromDate } },
+        })
+        .catch(() => 0),
+
+      prisma.userActivity
+        .groupBy({
+          by: ["action"],
+          _count: { action: true },
+          where: {
+            createdAt: { gte: fromDate },
+            action: {
+              in: [
+                "video_play",
+                "video_pause",
+                "quiz_start",
+                "quiz_complete",
+                "download",
+                "bookmark",
+              ],
+            },
+          },
+        })
+        .catch(() => []),
+
+      prisma.enrollment
+        .aggregate({
+          _avg: { progress: true },
+          where: { createdAt: { gte: fromDate } },
+        })
+        .catch(() => ({ _avg: { progress: 0 } })),
+
+      prisma.review
+        .count({
+          where: { createdAt: { gte: fromDate } },
+        })
+        .catch(() => 0),
     ]);
 
     const analytics = {
@@ -1407,12 +1714,14 @@ export const getRealtimeStats = asyncHandler(async (req, res) => {
       systemHealth,
       liveEnrollments,
     ] = await Promise.all([
-      prisma.session.count({
-        where: {
-          isActive: true,
-          lastActivity: { gte: new Date(Date.now() - 30 * 60 * 1000) },
-        },
-      }),
+      prisma.session
+        .count({
+          where: {
+            isActive: true,
+            lastActivity: { gte: new Date(Date.now() - 30 * 60 * 1000) },
+          },
+        })
+        .catch(() => 0),
 
       prisma.user.count({
         where: { createdAt: { gte: last24Hours } },
@@ -1427,25 +1736,27 @@ export const getRealtimeStats = asyncHandler(async (req, res) => {
         _count: { id: true },
         where: {
           status: "COMPLETED",
-          createdAt: { gte: new Date().setHours(0, 0, 0, 0) },
+          createdAt: { gte: new Date(new Date().setHours(0, 0, 0, 0)) },
         },
       }),
 
-      prisma.userActivity.findMany({
-        select: {
-          action: true,
-          createdAt: true,
-          user: {
-            select: {
-              firstName: true,
-              lastName: true,
+      prisma.userActivity
+        .findMany({
+          select: {
+            action: true,
+            createdAt: true,
+            user: {
+              select: {
+                firstName: true,
+                lastName: true,
+              },
             },
           },
-        },
-        where: { createdAt: { gte: new Date(Date.now() - 10 * 60 * 1000) } },
-        orderBy: { createdAt: "desc" },
-        take: 20,
-      }),
+          where: { createdAt: { gte: new Date(Date.now() - 10 * 60 * 1000) } },
+          orderBy: { createdAt: "desc" },
+          take: 20,
+        })
+        .catch(() => []),
 
       redisService.exists("system_health"),
 
@@ -1502,6 +1813,121 @@ export const getRealtimeStats = asyncHandler(async (req, res) => {
   }
 });
 
+const convertToCSV = (data) => {
+  if (!Array.isArray(data) || data.length === 0) {
+    return "";
+  }
+
+  const flattenObject = (obj, prefix = "") => {
+    const flattened = {};
+    for (const key in obj) {
+      if (
+        obj[key] !== null &&
+        typeof obj[key] === "object" &&
+        !Array.isArray(obj[key]) &&
+        !(obj[key] instanceof Date)
+      ) {
+        Object.assign(flattened, flattenObject(obj[key], `${prefix}${key}.`));
+      } else {
+        flattened[`${prefix}${key}`] = obj[key];
+      }
+    }
+    return flattened;
+  };
+
+  const flattenedData = data.map((item) => flattenObject(item));
+  const headers = Object.keys(flattenedData[0]);
+
+  const csvRows = [
+    headers.join(","),
+    ...flattenedData.map((row) =>
+      headers
+        .map((header) => {
+          const value = row[header];
+          if (value === null || value === undefined) return "";
+          if (
+            typeof value === "string" &&
+            (value.includes(",") || value.includes('"') || value.includes("\n"))
+          ) {
+            return `"${value.replace(/"/g, '""')}"`;
+          }
+          return value;
+        })
+        .join(",")
+    ),
+  ];
+
+  return csvRows.join("\n");
+};
+
+export const downloadExportedData = asyncHandler(async (req, res) => {
+  const startTime = performance.now();
+
+  try {
+    const { exportId } = req.params;
+    const { format } = req.query;
+
+    const exportData = await redisService.getJSON(`export:${exportId}`);
+
+    if (!exportData) {
+      return res.status(404).json({
+        success: false,
+        message: "Export not found or expired",
+        code: "EXPORT_NOT_FOUND",
+      });
+    }
+
+    const requestedFormat = format || exportData.format || "json";
+    const fileExtension = requestedFormat === "csv" ? "csv" : "json";
+    const filename = `educademy_analytics_${exportData.type}_${exportData.period}_${exportId}.${fileExtension}`;
+
+    if (requestedFormat === "csv") {
+      const csvData = convertToCSV(exportData.data);
+
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename}"`
+      );
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Pragma", "no-cache");
+
+      res.status(200).send(csvData);
+    } else {
+      res.setHeader("Content-Type", "application/json");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename}"`
+      );
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Pragma", "no-cache");
+
+      res.status(200).json({
+        exportInfo: {
+          exportId: exportData.exportId,
+          type: exportData.type,
+          period: exportData.period,
+          recordCount: exportData.recordCount,
+          generatedAt: exportData.generatedAt,
+          format: requestedFormat,
+        },
+        data: exportData.data,
+      });
+    }
+  } catch (error) {
+    console.error("Download export error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to download exported data",
+      code: "INTERNAL_SERVER_ERROR",
+      meta: {
+        executionTime: Math.round(performance.now() - startTime),
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+});
+
 export const exportAnalyticsData = asyncHandler(async (req, res) => {
   const startTime = performance.now();
 
@@ -1518,6 +1944,14 @@ export const exportAnalyticsData = asyncHandler(async (req, res) => {
       });
     }
 
+    if (!["json", "csv"].includes(format)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid format. Supported formats: json, csv",
+        code: "INVALID_FORMAT",
+      });
+    }
+
     const exportId = generateAnalyticsId();
     const fromDate = getDateRange(period);
 
@@ -1525,18 +1959,46 @@ export const exportAnalyticsData = asyncHandler(async (req, res) => {
 
     switch (type) {
       case "dashboard":
-        const dashboardResponse = await getDashboardOverview(
+        const dashboardStats = await Promise.all([
+          prisma.user.count(),
+          prisma.course.count({ where: { status: "PUBLISHED" } }),
+          prisma.payment.aggregate({
+            _sum: { amount: true },
+            where: { status: "COMPLETED" },
+          }),
+          prisma.enrollment.count(),
+        ]);
+
+        exportData = [
           {
-            query: { period, refresh: "true" },
+            metric: "Total Users",
+            value: dashboardStats[0],
+            type: "count",
+            period: period,
+            generatedAt: new Date().toISOString(),
           },
           {
-            status: () => ({
-              json: (data) => {
-                exportData = data.data;
-              },
-            }),
-          }
-        );
+            metric: "Total Courses",
+            value: dashboardStats[1],
+            type: "count",
+            period: period,
+            generatedAt: new Date().toISOString(),
+          },
+          {
+            metric: "Total Revenue",
+            value: Number(dashboardStats[2]._sum?.amount || 0),
+            type: "revenue",
+            period: period,
+            generatedAt: new Date().toISOString(),
+          },
+          {
+            metric: "Total Enrollments",
+            value: dashboardStats[3],
+            type: "count",
+            period: period,
+            generatedAt: new Date().toISOString(),
+          },
+        ];
         break;
 
       case "users":
@@ -1608,6 +2070,28 @@ export const exportAnalyticsData = asyncHandler(async (req, res) => {
           },
         });
         break;
+
+      case "engagement":
+        exportData = await prisma.userActivity
+          .findMany({
+            select: {
+              id: true,
+              action: true,
+              page: true,
+              createdAt: true,
+              user: {
+                select: {
+                  email: true,
+                  firstName: true,
+                  lastName: true,
+                },
+              },
+            },
+            where: { createdAt: { gte: fromDate } },
+            take: 10000,
+          })
+          .catch(() => []);
+        break;
     }
 
     const exportRecord = {
@@ -1636,7 +2120,7 @@ export const exportAnalyticsData = asyncHandler(async (req, res) => {
       message: "Analytics data exported successfully",
       data: {
         exportId,
-        downloadUrl: `/api/admin/analytics/download/${exportId}`,
+        downloadUrl: `/api/admin/analytics/download/${exportId}?format=${format}`,
         ...exportRecord,
       },
       meta: {
@@ -1649,51 +2133,6 @@ export const exportAnalyticsData = asyncHandler(async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to export analytics data",
-      code: "INTERNAL_SERVER_ERROR",
-      meta: {
-        executionTime: Math.round(performance.now() - startTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
-export const downloadExportedData = asyncHandler(async (req, res) => {
-  const startTime = performance.now();
-
-  try {
-    const { exportId } = req.params;
-
-    const exportData = await redisService.getJSON(`export:${exportId}`);
-
-    if (!exportData) {
-      return res.status(404).json({
-        success: false,
-        message: "Export not found or expired",
-        code: "EXPORT_NOT_FOUND",
-      });
-    }
-
-    const filename = `educademy_analytics_${exportData.type}_${exportData.period}_${exportId}.json`;
-
-    res.setHeader("Content-Type", "application/json");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-
-    res.status(200).json({
-      exportInfo: {
-        exportId: exportData.exportId,
-        type: exportData.type,
-        period: exportData.period,
-        recordCount: exportData.recordCount,
-        generatedAt: exportData.generatedAt,
-      },
-      data: exportData.data,
-    });
-  } catch (error) {
-    console.error("Download export error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to download exported data",
       code: "INTERNAL_SERVER_ERROR",
       meta: {
         executionTime: Math.round(performance.now() - startTime),

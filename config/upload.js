@@ -241,24 +241,41 @@ export const uploadCourseMedia = multer({
   },
 });
 
-// ✅ FIXED: Helper function to determine resource type from URL/publicId
-const getResourceType = (publicId) => {
-  // Check file extension or folder structure to determine resource type
+// ✅ FIXED: Helper function to determine resource type from MIME type and publicId
+const getResourceType = (publicId, mimeType = null) => {
   const lowerPublicId = publicId.toLowerCase();
 
-  // Check for common image extensions
+  // If we have MIME type, use it for more accurate detection
+  if (mimeType) {
+    if (mimeType.startsWith("image/")) {
+      return "image";
+    }
+    if (mimeType.startsWith("video/")) {
+      return "video";
+    }
+    if (mimeType.startsWith("audio/")) {
+      return "video"; // Cloudinary treats audio as video resource type
+    }
+    if (mimeType.startsWith("application/") || mimeType.startsWith("text/")) {
+      return "raw";
+    }
+  }
+
+  // Fallback to file extension detection
   if (lowerPublicId.match(/\.(jpg|jpeg|png|gif|webp|bmp|tiff|svg)$/)) {
     return "image";
   }
 
-  // Check for common video extensions
   if (lowerPublicId.match(/\.(mp4|avi|mov|wmv|flv|webm|mkv|m4v|3gp)$/)) {
     return "video";
   }
 
-  // Check for common audio extensions
   if (lowerPublicId.match(/\.(mp3|wav|aac|ogg|flac|m4a)$/)) {
     return "video"; // Cloudinary treats audio as video resource type
+  }
+
+  if (lowerPublicId.match(/\.(pdf|doc|docx|txt|rtf)$/)) {
+    return "raw";
   }
 
   // Check by folder structure
@@ -277,18 +294,27 @@ const getResourceType = (publicId) => {
     return "video"; // Cloudinary treats audio as video resource type
   }
 
-  // Default to image for profile images and most common use cases
+  if (lowerPublicId.includes("/documents/")) {
+    return "raw";
+  }
+
+  // Default fallback
   return "image";
 };
 
-// ✅ FIXED: Updated deleteFromCloudinary function
-export const deleteFromCloudinary = async (publicId, resourceType = null) => {
+// ✅ COMPLETELY REWRITTEN: Enhanced deleteFromCloudinary function
+export const deleteFromCloudinary = async (
+  publicId,
+  resourceType = null,
+  mimeType = null
+) => {
   try {
-    // If no resource type provided, try to determine it
-    const finalResourceType = resourceType || getResourceType(publicId);
+    // Determine the resource type if not provided
+    const finalResourceType =
+      resourceType || getResourceType(publicId, mimeType);
 
     console.log(
-      `Deleting from Cloudinary: ${publicId} with resource_type: ${finalResourceType}`
+      `Attempting to delete from Cloudinary: ${publicId} with resource_type: ${finalResourceType}`
     );
 
     const result = await cloudinary.uploader.destroy(publicId, {
@@ -296,29 +322,39 @@ export const deleteFromCloudinary = async (publicId, resourceType = null) => {
     });
 
     console.log(`Cloudinary deletion result:`, result);
-    return result;
-  } catch (error) {
-    console.error("Error deleting from Cloudinary:", error);
 
-    // If deletion fails with image type, try with video type (for audio files)
-    if (resourceType === null && error.message.includes("resource type")) {
-      try {
-        console.log(
-          `Retrying deletion with video resource type for: ${publicId}`
-        );
-        const result = await cloudinary.uploader.destroy(publicId, {
-          resource_type: "video",
-        });
-        return result;
-      } catch (retryError) {
-        console.error(
-          "Retry with video resource type also failed:",
-          retryError
-        );
-        throw retryError;
+    // If deletion was unsuccessful, try other resource types
+    if (result.result !== "ok" && !resourceType) {
+      const alternativeTypes = ["image", "video", "raw"].filter(
+        (type) => type !== finalResourceType
+      );
+
+      for (const altType of alternativeTypes) {
+        try {
+          console.log(
+            `Retrying deletion with resource type: ${altType} for ${publicId}`
+          );
+
+          const retryResult = await cloudinary.uploader.destroy(publicId, {
+            resource_type: altType,
+          });
+
+          if (retryResult.result === "ok") {
+            console.log(`Successfully deleted with resource type: ${altType}`);
+            return retryResult;
+          }
+        } catch (retryError) {
+          console.log(
+            `Failed to delete with resource type: ${altType}`,
+            retryError.message
+          );
+        }
       }
     }
 
+    return result;
+  } catch (error) {
+    console.error("Error deleting from Cloudinary:", error);
     throw error;
   }
 };

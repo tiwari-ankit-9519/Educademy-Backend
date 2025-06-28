@@ -12,12 +12,14 @@ import {
 
 const router = express.Router();
 
-router.get("/pending", requireAdmin, getPendingCourses);
-router.get("/stats", requireAdmin, getCourseStats);
-router.get("/:courseId/review", requireAdmin, getCourseReviewDetails);
-router.get("/:courseId/history", requireAdmin, getCourseReviewHistory);
-router.post("/:courseId/review", requireAdmin, reviewCourse);
-router.put("/:courseId/status", requireAdmin, updateCourseStatus);
-router.post("/bulk-actions", requireAdmin, bulkCourseActions);
+router.use(requireAdmin);
+
+router.get("/pending", getPendingCourses);
+router.get("/stats", getCourseStats);
+router.get("/:courseId/review", getCourseReviewDetails);
+router.get("/:courseId/history", getCourseReviewHistory);
+router.post("/:courseId/review", reviewCourse);
+router.put("/:courseId/status", updateCourseStatus);
+router.post("/bulk-actions", bulkCourseActions);
 
 export default router;

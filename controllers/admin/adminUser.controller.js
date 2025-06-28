@@ -3,6 +3,7 @@ import asyncHandler from "express-async-handler";
 import redisService from "../../utils/redis.js";
 import emailService from "../../utils/emailService.js";
 import notificationService from "../../utils/notificationservice.js";
+import { deleteFromCloudinary } from "../../config/upload.js";
 
 const prisma = new PrismaClient();
 
@@ -10,6 +11,16 @@ const generateRequestId = () => {
   return `admin_action_${Date.now()}_${Math.random()
     .toString(36)
     .substr(2, 9)}`;
+};
+
+const generateVerificationBadge = (verificationLevel) => {
+  const badges = {
+    BASIC: "✓ Verified Instructor",
+    EXPERT: "⭐ Expert Instructor",
+    PREMIUM: "👑 Premium Instructor",
+    INDUSTRY: "🏆 Industry Expert",
+  };
+  return badges[verificationLevel] || badges.BASIC;
 };
 
 export const getAllUsers = asyncHandler(async (req, res) => {
@@ -264,7 +275,20 @@ export const getUserDetails = asyncHandler(async (req, res) => {
               },
               take: 5,
             },
-            reviews: {
+            cart: {
+              include: {
+                course: {
+                  select: {
+                    id: true,
+                    title: true,
+                    thumbnail: true,
+                    price: true,
+                  },
+                },
+              },
+              take: 5,
+            },
+            certificates: {
               include: {
                 course: {
                   select: {
@@ -304,6 +328,18 @@ export const getUserDetails = asyncHandler(async (req, res) => {
           },
         },
         adminProfile: true,
+        reviews: {
+          include: {
+            course: {
+              select: {
+                id: true,
+                title: true,
+              },
+            },
+          },
+          take: 5,
+          orderBy: { createdAt: "desc" },
+        },
         sessions: {
           where: { isActive: true },
           select: {
@@ -333,6 +369,23 @@ export const getUserDetails = asyncHandler(async (req, res) => {
           take: 20,
           orderBy: { createdAt: "desc" },
         },
+        socialLogins: {
+          select: {
+            provider: true,
+            createdAt: true,
+          },
+        },
+        supportTickets: {
+          select: {
+            id: true,
+            subject: true,
+            status: true,
+            priority: true,
+            createdAt: true,
+          },
+          take: 5,
+          orderBy: { createdAt: "desc" },
+        },
       },
     });
 
@@ -353,7 +406,38 @@ export const getUserDetails = asyncHandler(async (req, res) => {
       accountAge: Math.floor(
         (new Date() - new Date(user.createdAt)) / (1000 * 60 * 60 * 24)
       ),
+      totalReviews: user.reviews.length,
+      averageRating:
+        user.reviews.length > 0
+          ? (
+              user.reviews.reduce((sum, review) => sum + review.rating, 0) /
+              user.reviews.length
+            ).toFixed(1)
+          : 0,
+      totalSupportTickets: user.supportTickets.length,
+      socialLoginProviders: user.socialLogins.map((login) => login.provider),
     };
+
+    if (user.role === "STUDENT" && user.studentProfile) {
+      userStats.totalEnrollments = user.studentProfile.enrollments.length;
+      userStats.totalWishlistItems = user.studentProfile.wishlist.length;
+      userStats.totalCartItems = user.studentProfile.cart.length;
+      userStats.totalCertificates = user.studentProfile.certificates.length;
+      userStats.totalLearningTime = user.studentProfile.totalLearningTime;
+      userStats.skillLevel = user.studentProfile.skillLevel;
+    }
+
+    if (user.role === "INSTRUCTOR" && user.instructorProfile) {
+      userStats.totalCourses = user.instructorProfile.totalCourses;
+      userStats.totalStudents = user.instructorProfile.totalStudents;
+      userStats.totalRevenue = Number(user.instructorProfile.totalRevenue);
+      userStats.instructorRating = user.instructorProfile.rating;
+      userStats.isVerifiedInstructor = user.instructorProfile.isVerified;
+      userStats.totalEarnings = user.instructorProfile.earnings.reduce(
+        (sum, earning) => sum + Number(earning.amount),
+        0
+      );
+    }
 
     const userDetails = {
       id: user.id,
@@ -385,9 +469,12 @@ export const getUserDetails = asyncHandler(async (req, res) => {
           : user.role === "INSTRUCTOR"
           ? user.instructorProfile
           : user.adminProfile,
+      reviews: user.reviews,
       sessions: user.sessions,
       recentActivities: user.userActivities,
       recentNotifications: user.notifications,
+      socialLogins: user.socialLogins,
+      supportTickets: user.supportTickets,
       stats: userStats,
     };
 
@@ -1379,15 +1466,7 @@ export const createCategory = asyncHandler(async (req, res) => {
   const startTime = performance.now();
 
   try {
-    const {
-      name,
-      description,
-      image,
-      icon,
-      color,
-      parentId,
-      order = 0,
-    } = req.body;
+    const { name, description, icon, color, parentId, order = 0 } = req.body;
 
     if (!name) {
       return res.status(400).json({
@@ -1411,6 +1490,13 @@ export const createCategory = asyncHandler(async (req, res) => {
     });
 
     if (existingCategory) {
+      if (req.file) {
+        const publicId = req.file.filename || req.file.public_id;
+        if (publicId) {
+          await deleteFromCloudinary(publicId, "image");
+        }
+      }
+
       return res.status(400).json({
         success: false,
         message: "Category with this name or slug already exists",
@@ -1424,6 +1510,13 @@ export const createCategory = asyncHandler(async (req, res) => {
       });
 
       if (!parentCategory) {
+        if (req.file) {
+          const publicId = req.file.filename || req.file.public_id;
+          if (publicId) {
+            await deleteFromCloudinary(publicId, "image");
+          }
+        }
+
         return res.status(400).json({
           success: false,
           message: "Parent category not found",
@@ -1432,6 +1525,13 @@ export const createCategory = asyncHandler(async (req, res) => {
       }
 
       if (parentCategory.parentId) {
+        if (req.file) {
+          const publicId = req.file.filename || req.file.public_id;
+          if (publicId) {
+            await deleteFromCloudinary(publicId, "image");
+          }
+        }
+
         return res.status(400).json({
           success: false,
           message: "Cannot create subcategory under another subcategory",
@@ -1440,12 +1540,20 @@ export const createCategory = asyncHandler(async (req, res) => {
       }
     }
 
+    let imageUrl = null;
+    let imagePublicId = null;
+
+    if (req.file) {
+      imageUrl = req.file.path;
+      imagePublicId = req.file.filename || req.file.public_id;
+    }
+
     const category = await prisma.category.create({
       data: {
         name,
         slug,
         description,
-        image,
+        image: imageUrl,
         icon,
         color,
         parentId,
@@ -1458,6 +1566,12 @@ export const createCategory = asyncHandler(async (req, res) => {
             id: true,
             name: true,
             slug: true,
+          },
+        },
+        _count: {
+          select: {
+            subcategories: true,
+            courses: true,
           },
         },
       },
@@ -1478,11 +1592,14 @@ export const createCategory = asyncHandler(async (req, res) => {
         slug: category.slug,
         description: category.description,
         image: category.image,
+        imagePublicId: imagePublicId,
         icon: category.icon,
         color: category.color,
         order: category.order,
         isActive: category.isActive,
         parent: category.parent,
+        subcategoriesCount: category._count.subcategories,
+        coursesCount: category._count.courses,
         createdAt: category.createdAt,
       },
       meta: {
@@ -1492,6 +1609,21 @@ export const createCategory = asyncHandler(async (req, res) => {
     });
   } catch (error) {
     console.error("Create category error:", error);
+
+    if (req.file) {
+      const publicId = req.file.filename || req.file.public_id;
+      if (publicId) {
+        try {
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error(
+            "Error deleting uploaded file after error:",
+            deleteError
+          );
+        }
+      }
+    }
+
     res.status(500).json({
       success: false,
       message: "Failed to create category",
@@ -1509,7 +1641,7 @@ export const updateCategory = asyncHandler(async (req, res) => {
 
   try {
     const { categoryId } = req.params;
-    const { name, description, image, icon, color, parentId, order, isActive } =
+    const { name, description, icon, color, parentId, order, isActive } =
       req.body;
 
     const existingCategory = await prisma.category.findUnique({
@@ -1517,6 +1649,13 @@ export const updateCategory = asyncHandler(async (req, res) => {
     });
 
     if (!existingCategory) {
+      if (req.file) {
+        const publicId = req.file.filename || req.file.public_id;
+        if (publicId) {
+          await deleteFromCloudinary(publicId, "image");
+        }
+      }
+
       return res.status(404).json({
         success: false,
         message: "Category not found",
@@ -1524,17 +1663,16 @@ export const updateCategory = asyncHandler(async (req, res) => {
       });
     }
 
-    let updateData = {};
-
+    let slug = existingCategory.slug;
     if (name && name !== existingCategory.name) {
-      const slug = name
+      slug = name
         .toLowerCase()
         .replace(/[^a-z0-9 -]/g, "")
         .replace(/\s+/g, "-")
         .replace(/-+/g, "-")
         .trim("-");
 
-      const duplicateCategory = await prisma.category.findFirst({
+      const existingSlug = await prisma.category.findFirst({
         where: {
           AND: [
             { id: { not: categoryId } },
@@ -1545,73 +1683,110 @@ export const updateCategory = asyncHandler(async (req, res) => {
         },
       });
 
-      if (duplicateCategory) {
+      if (existingSlug) {
+        if (req.file) {
+          const publicId = req.file.filename || req.file.public_id;
+          if (publicId) {
+            await deleteFromCloudinary(publicId, "image");
+          }
+        }
+
         return res.status(400).json({
           success: false,
-          message: "Category with this name already exists",
+          message: "Category with this name or slug already exists",
           code: "CATEGORY_EXISTS",
         });
       }
-
-      updateData.name = name;
-      updateData.slug = slug;
     }
 
-    if (description !== undefined) updateData.description = description;
-    if (image !== undefined) updateData.image = image;
-    if (icon !== undefined) updateData.icon = icon;
-    if (color !== undefined) updateData.color = color;
-    if (order !== undefined) updateData.order = parseInt(order);
-    if (isActive !== undefined) updateData.isActive = isActive;
-
-    if (parentId !== undefined) {
+    if (parentId && parentId !== existingCategory.parentId) {
       if (parentId === categoryId) {
+        if (req.file) {
+          const publicId = req.file.filename || req.file.public_id;
+          if (publicId) {
+            await deleteFromCloudinary(publicId, "image");
+          }
+        }
+
         return res.status(400).json({
           success: false,
-          message: "Category cannot be parent of itself",
-          code: "SELF_PARENT_NOT_ALLOWED",
+          message: "Category cannot be its own parent",
+          code: "INVALID_PARENT",
         });
       }
 
-      if (parentId) {
-        const parentCategory = await prisma.category.findUnique({
-          where: { id: parentId },
+      const parentCategory = await prisma.category.findUnique({
+        where: { id: parentId },
+      });
+
+      if (!parentCategory) {
+        if (req.file) {
+          const publicId = req.file.filename || req.file.public_id;
+          if (publicId) {
+            await deleteFromCloudinary(publicId, "image");
+          }
+        }
+
+        return res.status(400).json({
+          success: false,
+          message: "Parent category not found",
+          code: "PARENT_NOT_FOUND",
         });
-
-        if (!parentCategory) {
-          return res.status(400).json({
-            success: false,
-            message: "Parent category not found",
-            code: "PARENT_NOT_FOUND",
-          });
-        }
-
-        if (parentCategory.parentId) {
-          return res.status(400).json({
-            success: false,
-            message: "Cannot set subcategory as parent",
-            code: "SUBCATEGORY_AS_PARENT_NOT_ALLOWED",
-          });
-        }
-
-        const childCategories = await prisma.category.findMany({
-          where: { parentId: categoryId },
-        });
-
-        if (childCategories.length > 0) {
-          return res.status(400).json({
-            success: false,
-            message:
-              "Cannot make category with subcategories a subcategory itself",
-            code: "CATEGORY_HAS_CHILDREN",
-          });
-        }
       }
 
-      updateData.parentId = parentId;
+      if (parentCategory.parentId) {
+        if (req.file) {
+          const publicId = req.file.filename || req.file.public_id;
+          if (publicId) {
+            await deleteFromCloudinary(publicId, "image");
+          }
+        }
+
+        return res.status(400).json({
+          success: false,
+          message: "Cannot create subcategory under another subcategory",
+          code: "NESTED_SUBCATEGORY_NOT_ALLOWED",
+        });
+      }
     }
 
-    const updatedCategory = await prisma.category.update({
+    let imageUrl = existingCategory.image;
+    let oldImagePublicId = null;
+
+    if (req.file) {
+      if (existingCategory.image) {
+        try {
+          const oldImageUrl = existingCategory.image;
+          const urlParts = oldImageUrl.split("/");
+          const publicIdWithExtension = urlParts[urlParts.length - 1];
+          oldImagePublicId = publicIdWithExtension.split(".")[0];
+
+          const folderPath = urlParts.slice(-3, -1).join("/");
+          if (folderPath) {
+            oldImagePublicId = `${folderPath}/${oldImagePublicId}`;
+          }
+        } catch (error) {
+          console.error("Error parsing old image URL:", error);
+        }
+      }
+
+      imageUrl = req.file.path;
+    }
+
+    const updateData = {
+      ...(name && { name, slug }),
+      ...(description !== undefined && { description }),
+      ...(imageUrl && { image: imageUrl }),
+      ...(icon !== undefined && { icon }),
+      ...(color !== undefined && { color }),
+      ...(parentId !== undefined && { parentId }),
+      ...(order !== undefined && { order: parseInt(order) }),
+      ...(isActive !== undefined && {
+        isActive: isActive === "true" || isActive === true,
+      }),
+    };
+
+    const category = await prisma.category.update({
       where: { id: categoryId },
       data: updateData,
       include: {
@@ -1622,20 +1797,26 @@ export const updateCategory = asyncHandler(async (req, res) => {
             slug: true,
           },
         },
-        subcategories: {
+        _count: {
           select: {
-            id: true,
-            name: true,
-            slug: true,
+            subcategories: true,
+            courses: true,
           },
         },
       },
     });
 
+    if (oldImagePublicId && req.file) {
+      try {
+        await deleteFromCloudinary(oldImagePublicId, "image");
+      } catch (deleteError) {
+        console.error("Error deleting old image:", deleteError);
+      }
+    }
+
     await redisService.delPattern("admin_categories:*");
     await redisService.delPattern("categories:*");
     await redisService.del("category_tree");
-    await redisService.del(`category:${categoryId}`);
 
     const executionTime = Math.round(performance.now() - startTime);
 
@@ -1643,18 +1824,19 @@ export const updateCategory = asyncHandler(async (req, res) => {
       success: true,
       message: "Category updated successfully",
       data: {
-        id: updatedCategory.id,
-        name: updatedCategory.name,
-        slug: updatedCategory.slug,
-        description: updatedCategory.description,
-        image: updatedCategory.image,
-        icon: updatedCategory.icon,
-        color: updatedCategory.color,
-        order: updatedCategory.order,
-        isActive: updatedCategory.isActive,
-        parent: updatedCategory.parent,
-        subcategories: updatedCategory.subcategories,
-        updatedAt: updatedCategory.updatedAt,
+        id: category.id,
+        name: category.name,
+        slug: category.slug,
+        description: category.description,
+        image: category.image,
+        icon: category.icon,
+        color: category.color,
+        order: category.order,
+        isActive: category.isActive,
+        parent: category.parent,
+        subcategoriesCount: category._count.subcategories,
+        coursesCount: category._count.courses,
+        updatedAt: category.updatedAt,
       },
       meta: {
         executionTime,
@@ -1663,6 +1845,21 @@ export const updateCategory = asyncHandler(async (req, res) => {
     });
   } catch (error) {
     console.error("Update category error:", error);
+
+    if (req.file) {
+      const publicId = req.file.filename || req.file.public_id;
+      if (publicId) {
+        try {
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error(
+            "Error deleting uploaded file after error:",
+            deleteError
+          );
+        }
+      }
+    }
+
     res.status(500).json({
       success: false,
       message: "Failed to update category",
@@ -1680,14 +1877,12 @@ export const deleteCategory = asyncHandler(async (req, res) => {
 
   try {
     const { categoryId } = req.params;
-    const { forceDelete = false } = req.query;
 
     const category = await prisma.category.findUnique({
       where: { id: categoryId },
       include: {
         subcategories: true,
         courses: true,
-        subcategoryCourses: true,
       },
     });
 
@@ -1699,42 +1894,42 @@ export const deleteCategory = asyncHandler(async (req, res) => {
       });
     }
 
-    const totalCourses =
-      category.courses.length + category.subcategoryCourses.length;
-    const hasSubcategories = category.subcategories.length > 0;
-
-    if (!forceDelete && (totalCourses > 0 || hasSubcategories)) {
+    if (category.subcategories.length > 0) {
       return res.status(400).json({
         success: false,
-        message:
-          "Cannot delete category with associated courses or subcategories",
-        code: "CATEGORY_HAS_DEPENDENCIES",
+        message: "Cannot delete category that has subcategories",
+        code: "HAS_SUBCATEGORIES",
         data: {
-          coursesCount: totalCourses,
           subcategoriesCount: category.subcategories.length,
-          forceDeleteRequired: true,
         },
       });
     }
 
-    if (forceDelete) {
-      if (hasSubcategories) {
-        await prisma.category.updateMany({
-          where: { parentId: categoryId },
-          data: { parentId: null },
-        });
-      }
+    if (category.courses.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot delete category that has courses",
+        code: "HAS_COURSES",
+        data: {
+          coursesCount: category.courses.length,
+        },
+      });
+    }
 
-      if (totalCourses > 0) {
-        await prisma.course.updateMany({
-          where: {
-            OR: [{ categoryId: categoryId }, { subcategoryId: categoryId }],
-          },
-          data: {
-            categoryId: category.parentId || categoryId,
-            subcategoryId: null,
-          },
-        });
+    let imagePublicId = null;
+    if (category.image) {
+      try {
+        const imageUrl = category.image;
+        const urlParts = imageUrl.split("/");
+        const publicIdWithExtension = urlParts[urlParts.length - 1];
+        imagePublicId = publicIdWithExtension.split(".")[0];
+
+        const folderPath = urlParts.slice(-3, -1).join("/");
+        if (folderPath) {
+          imagePublicId = `${folderPath}/${imagePublicId}`;
+        }
+      } catch (error) {
+        console.error("Error parsing image URL for deletion:", error);
       }
     }
 
@@ -1742,10 +1937,17 @@ export const deleteCategory = asyncHandler(async (req, res) => {
       where: { id: categoryId },
     });
 
+    if (imagePublicId) {
+      try {
+        await deleteFromCloudinary(imagePublicId, "image");
+      } catch (deleteError) {
+        console.error("Error deleting category image:", deleteError);
+      }
+    }
+
     await redisService.delPattern("admin_categories:*");
     await redisService.delPattern("categories:*");
     await redisService.del("category_tree");
-    await redisService.del(`category:${categoryId}`);
 
     const executionTime = Math.round(performance.now() - startTime);
 
@@ -1753,14 +1955,11 @@ export const deleteCategory = asyncHandler(async (req, res) => {
       success: true,
       message: "Category deleted successfully",
       data: {
-        deletedCategoryId: categoryId,
-        deletedCategoryName: category.name,
-        forceDelete,
-        reassignedCourses: forceDelete ? totalCourses : 0,
-        reassignedSubcategories: forceDelete
-          ? category.subcategories.length
-          : 0,
-        deletedAt: new Date().toISOString(),
+        deletedCategory: {
+          id: category.id,
+          name: category.name,
+          slug: category.slug,
+        },
       },
       meta: {
         executionTime,
@@ -1921,6 +2120,716 @@ export const getSingleCategory = asyncHandler(async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to retrieve category details",
+      code: "INTERNAL_SERVER_ERROR",
+      meta: {
+        executionTime: Math.round(performance.now() - startTime),
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+});
+
+export const getAllVerificationRequests = asyncHandler(async (req, res) => {
+  const startTime = performance.now();
+
+  try {
+    const {
+      page = 1,
+      limit = 20,
+      status,
+      verificationLevel,
+      priority,
+      sortBy = "submittedAt",
+      sortOrder = "desc",
+      search,
+    } = req.query;
+
+    const pageSize = Math.min(parseInt(limit), 100);
+    const pageNumber = Math.max(parseInt(page), 1);
+    const skip = (pageNumber - 1) * pageSize;
+
+    const cacheKey = `admin_verification_requests:${JSON.stringify({
+      page: pageNumber,
+      limit: pageSize,
+      status,
+      verificationLevel,
+      priority,
+      sortBy,
+      sortOrder,
+      search,
+    })}`;
+
+    let cachedResult = await redisService.getJSON(cacheKey);
+    if (cachedResult) {
+      return res.status(200).json({
+        success: true,
+        message: "Verification requests retrieved successfully",
+        data: cachedResult,
+        meta: {
+          cached: true,
+          executionTime: Math.round(performance.now() - startTime),
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+
+    const where = {};
+    if (status) where.status = status;
+    if (verificationLevel) where.verificationLevel = verificationLevel;
+    if (priority) where.priority = priority;
+    if (search) {
+      where.OR = [
+        {
+          instructor: {
+            user: {
+              OR: [
+                { firstName: { contains: search, mode: "insensitive" } },
+                { lastName: { contains: search, mode: "insensitive" } },
+                { email: { contains: search, mode: "insensitive" } },
+              ],
+            },
+          },
+        },
+        { requestId: { contains: search, mode: "insensitive" } },
+      ];
+    }
+
+    const orderBy = {};
+    if (
+      sortBy === "submittedAt" ||
+      sortBy === "reviewedAt" ||
+      sortBy === "createdAt" ||
+      sortBy === "updatedAt"
+    ) {
+      orderBy[sortBy] = sortOrder;
+    } else if (sortBy === "instructorName") {
+      orderBy.instructor = {
+        user: {
+          firstName: sortOrder,
+        },
+      };
+    } else {
+      orderBy[sortBy] = sortOrder;
+    }
+
+    const [requests, total] = await Promise.all([
+      prisma.verificationRequest.findMany({
+        where,
+        include: {
+          instructor: {
+            include: {
+              user: {
+                select: {
+                  firstName: true,
+                  lastName: true,
+                  email: true,
+                },
+              },
+            },
+          },
+          reviewedByUser: {
+            select: {
+              firstName: true,
+              lastName: true,
+            },
+          },
+        },
+        orderBy,
+        skip,
+        take: pageSize,
+      }),
+      prisma.verificationRequest.count({ where }),
+    ]);
+
+    const formattedRequests = requests.map((request) => ({
+      requestId: request.requestId,
+      instructorId: request.instructorId,
+      instructorName: `${request.instructor.user.firstName} ${request.instructor.user.lastName}`,
+      instructorEmail: request.instructor.user.email,
+      verificationLevel: request.verificationLevel,
+      status: request.status,
+      priority: request.priority,
+      submittedAt: request.submittedAt,
+      reviewedAt: request.reviewedAt,
+      reviewedBy: request.reviewedByUser
+        ? `${request.reviewedByUser.firstName} ${request.reviewedByUser.lastName}`
+        : null,
+      documentsCount: request.documents
+        ? Array.isArray(request.documents)
+          ? request.documents.length
+          : 0
+        : 0,
+      qualificationsCount: request.qualifications
+        ? Array.isArray(request.qualifications)
+          ? request.qualifications.length
+          : 0
+        : 0,
+      experienceCount: request.experience
+        ? Array.isArray(request.experience)
+          ? request.experience.length
+          : 0
+        : 0,
+      additionalInfo: request.additionalInfo
+        ? request.additionalInfo.substring(0, 100) + "..."
+        : null,
+    }));
+
+    const stats = await prisma.verificationRequest.groupBy({
+      by: ["status"],
+      _count: true,
+    });
+
+    const statsMap = stats.reduce((acc, stat) => {
+      acc[stat.status.toLowerCase()] = stat._count;
+      return acc;
+    }, {});
+
+    const levelStats = await prisma.verificationRequest.groupBy({
+      by: ["verificationLevel"],
+      _count: true,
+    });
+
+    const levelStatsMap = levelStats.reduce((acc, stat) => {
+      acc[`level_${stat.verificationLevel.toLowerCase()}`] = stat._count;
+      return acc;
+    }, {});
+
+    const result = {
+      requests: formattedRequests,
+      pagination: {
+        page: pageNumber,
+        limit: pageSize,
+        total,
+        totalPages: Math.ceil(total / pageSize),
+        hasNext: skip + pageSize < total,
+        hasPrev: pageNumber > 1,
+      },
+      filters: {
+        status,
+        verificationLevel,
+        priority,
+        search,
+      },
+      sort: {
+        sortBy,
+        sortOrder,
+      },
+      stats: {
+        totalRequests: total,
+        pendingRequests: statsMap.pending || 0,
+        approvedRequests: statsMap.approved || 0,
+        rejectedRequests: statsMap.rejected || 0,
+        underReviewRequests: statsMap.under_review || 0,
+        levelBasic: levelStatsMap.level_basic || 0,
+        levelPremium: levelStatsMap.level_premium || 0,
+        levelExpert: levelStatsMap.level_expert || 0,
+      },
+    };
+
+    await redisService.setJSON(cacheKey, result, { ex: 300 });
+
+    const executionTime = Math.round(performance.now() - startTime);
+
+    res.status(200).json({
+      success: true,
+      message: "Verification requests retrieved successfully",
+      data: result,
+      meta: {
+        cached: false,
+        executionTime,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("Get all verification requests error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve verification requests",
+      code: "INTERNAL_SERVER_ERROR",
+      meta: {
+        executionTime: Math.round(performance.now() - startTime),
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+});
+
+export const getVerificationRequestById = asyncHandler(async (req, res) => {
+  const startTime = performance.now();
+
+  try {
+    const { requestId } = req.params;
+
+    if (!requestId) {
+      return res.status(400).json({
+        success: false,
+        message: "Request ID is required",
+        code: "REQUEST_ID_REQUIRED",
+      });
+    }
+
+    let requestData = await redisService.getJSON(
+      `verification_request:${requestId}`
+    );
+
+    if (!requestData) {
+      requestData = await prisma.verificationRequest.findUnique({
+        where: { requestId },
+        include: {
+          instructor: {
+            include: {
+              user: {
+                select: {
+                  firstName: true,
+                  lastName: true,
+                  email: true,
+                },
+              },
+            },
+          },
+          reviewedByUser: {
+            select: {
+              firstName: true,
+              lastName: true,
+            },
+          },
+        },
+      });
+
+      if (requestData) {
+        const formattedData = {
+          ...requestData,
+          instructorName: `${requestData.instructor.user.firstName} ${requestData.instructor.user.lastName}`,
+          instructorEmail: requestData.instructor.user.email,
+          reviewedBy: requestData.reviewedByUser
+            ? `${requestData.reviewedByUser.firstName} ${requestData.reviewedByUser.lastName}`
+            : null,
+        };
+        await redisService.setJSON(
+          `verification_request:${requestId}`,
+          formattedData,
+          { ex: 7 * 24 * 60 * 60 }
+        );
+        requestData = formattedData;
+      }
+    }
+
+    if (!requestData) {
+      return res.status(404).json({
+        success: false,
+        message: "Verification request not found",
+        code: "REQUEST_NOT_FOUND",
+      });
+    }
+
+    const executionTime = Math.round(performance.now() - startTime);
+
+    res.status(200).json({
+      success: true,
+      message: "Verification request retrieved successfully",
+      data: {
+        request: requestData,
+      },
+      meta: {
+        executionTime,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("Get verification request by ID error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve verification request",
+      code: "INTERNAL_SERVER_ERROR",
+      meta: {
+        executionTime: Math.round(performance.now() - startTime),
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+});
+
+export const reviewVerificationRequest = asyncHandler(async (req, res) => {
+  const startTime = performance.now();
+
+  try {
+    const { requestId } = req.params;
+    const { action, adminNotes, rejectionReason } = req.body;
+    const adminId = req.userAuthId;
+
+    if (!["APPROVE", "REJECT"].includes(action)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid action. Must be APPROVE or REJECT",
+        code: "INVALID_ACTION",
+      });
+    }
+
+    if (action === "REJECT" && !rejectionReason) {
+      return res.status(400).json({
+        success: false,
+        message: "Rejection reason is required when rejecting a request",
+        code: "REJECTION_REASON_REQUIRED",
+      });
+    }
+
+    const verificationRequest = await prisma.verificationRequest.findUnique({
+      where: { requestId },
+      include: {
+        instructor: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!verificationRequest) {
+      return res.status(404).json({
+        success: false,
+        message: "Verification request not found",
+        code: "REQUEST_NOT_FOUND",
+      });
+    }
+
+    if (verificationRequest.status !== "PENDING") {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot review ${verificationRequest.status.toLowerCase()} verification request`,
+        code: "INVALID_STATUS",
+      });
+    }
+
+    const admin = await prisma.user.findUnique({
+      where: { id: adminId },
+      select: { firstName: true, lastName: true, email: true },
+    });
+
+    const newStatus = action === "APPROVE" ? "APPROVED" : "REJECTED";
+    const verificationBadge =
+      action === "APPROVE"
+        ? `${verificationRequest.verificationLevel}_VERIFIED`
+        : null;
+
+    const updatedRequest = await prisma.$transaction(async (tx) => {
+      const request = await tx.verificationRequest.update({
+        where: { requestId },
+        data: {
+          status: newStatus,
+          reviewedAt: new Date(),
+          reviewedBy: `${admin.firstName} ${admin.lastName}`,
+          reviewedById: adminId,
+          adminNotes: adminNotes || "",
+          rejectionReason: action === "REJECT" ? rejectionReason : null,
+        },
+        include: {
+          instructor: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  email: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (action === "APPROVE") {
+        await tx.instructor.update({
+          where: { id: verificationRequest.instructorId },
+          data: {
+            isVerified: true,
+            verificationBadge: verificationBadge,
+          },
+        });
+
+        await tx.user.update({
+          where: { id: verificationRequest.instructor.user.id },
+          data: {
+            isVerified: true,
+          },
+        });
+      }
+
+      return request;
+    });
+
+    await Promise.all([
+      redisService.setJSON(
+        `verification_request:${requestId}`,
+        {
+          ...updatedRequest,
+          instructorName: `${updatedRequest.instructor.user.firstName} ${updatedRequest.instructor.user.lastName}`,
+          instructorEmail: updatedRequest.instructor.user.email,
+        },
+        { ex: 30 * 24 * 60 * 60 }
+      ),
+      redisService.del(
+        `verification_request:instructor:${verificationRequest.instructorId}`
+      ),
+      redisService.zrem("verification_requests:pending", requestId),
+      redisService.del(
+        `instructor_profile:${verificationRequest.instructorId}`
+      ),
+      redisService.del(
+        `user_profile:${verificationRequest.instructor.user.id}`
+      ),
+      redisService.delPattern(
+        `profile_cache:*${verificationRequest.instructor.user.id}*`
+      ),
+      redisService.delPattern("admin_verification_requests:*"),
+    ]);
+
+    setImmediate(async () => {
+      try {
+        if (action === "APPROVE") {
+          await Promise.all([
+            emailService.send({
+              to: verificationRequest.instructor.user.email,
+              subject: "Verification Approved - Congratulations! 🎉",
+              template: "verification",
+              templateData: {
+                userName: verificationRequest.instructor.user.firstName,
+                title: "Verification Approved!",
+                subtitle: "Your instructor verification has been approved",
+                message: `Congratulations! Your ${verificationRequest.verificationLevel.toLowerCase()} verification request has been approved. You now have a verified instructor badge on your profile.`,
+                isSuccess: true,
+                actionButton: "View Profile",
+                actionUrl: `${process.env.FRONTEND_URL}/instructor/profile`,
+                achievements: [
+                  "Verified instructor status granted",
+                  `${verificationBadge} badge added to profile`,
+                  "Enhanced credibility and visibility",
+                  "Access to premium instructor features",
+                ],
+              },
+            }),
+            notificationService.createNotification({
+              userId: verificationRequest.instructor.user.id,
+              type: "SYSTEM_ANNOUNCEMENT",
+              title: "Verification Approved!",
+              message: `Congratulations! Your ${verificationRequest.verificationLevel.toLowerCase()} verification has been approved.`,
+              priority: "HIGH",
+              data: {
+                requestId,
+                verificationLevel: verificationRequest.verificationLevel,
+                verificationBadge: verificationBadge,
+                approvedAt: updatedRequest.reviewedAt,
+                notificationType: "verification_approved",
+              },
+              actionUrl: "/instructor/profile",
+            }),
+          ]);
+        } else {
+          await Promise.all([
+            emailService.send({
+              to: verificationRequest.instructor.user.email,
+              subject: "Verification Update Required - Educademy",
+              template: "verification",
+              templateData: {
+                userName: verificationRequest.instructor.user.firstName,
+                title: "Verification Update Required",
+                subtitle:
+                  "Your verification request needs additional information",
+                message:
+                  "Your verification request has been reviewed and requires some updates before it can be approved. Please review the feedback and resubmit your request.",
+                isSuccess: false,
+                actionButton: "Update Request",
+                actionUrl: `${process.env.FRONTEND_URL}/instructor/verification`,
+                suggestions: [
+                  rejectionReason,
+                  "Review all required documents",
+                  "Ensure all information is accurate and complete",
+                  "Contact support if you need assistance",
+                ],
+              },
+            }),
+            notificationService.createNotification({
+              userId: verificationRequest.instructor.user.id,
+              type: "SYSTEM_ANNOUNCEMENT",
+              title: "Verification Update Required",
+              message: `Your ${verificationRequest.verificationLevel.toLowerCase()} verification request needs updates before approval.`,
+              priority: "NORMAL",
+              data: {
+                requestId,
+                rejectionReason,
+                verificationLevel: verificationRequest.verificationLevel,
+                rejectedAt: updatedRequest.reviewedAt,
+                notificationType: "verification_rejected",
+              },
+              actionUrl: "/instructor/verification",
+            }),
+          ]);
+        }
+      } catch (error) {
+        console.error("Background notification error:", error);
+      }
+    });
+
+    const executionTime = Math.round(performance.now() - startTime);
+
+    res.status(200).json({
+      success: true,
+      message: `Verification request ${action.toLowerCase()}d successfully`,
+      data: {
+        requestId: updatedRequest.requestId,
+        status: updatedRequest.status,
+        reviewedAt: updatedRequest.reviewedAt,
+        reviewedBy: updatedRequest.reviewedBy,
+        verificationLevel: updatedRequest.verificationLevel,
+        verificationBadge: verificationBadge,
+      },
+      meta: {
+        executionTime,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("Review verification request error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to review verification request",
+      code: "INTERNAL_SERVER_ERROR",
+      meta: {
+        executionTime: Math.round(performance.now() - startTime),
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+});
+
+export const getVerificationStats = asyncHandler(async (req, res) => {
+  const startTime = performance.now();
+
+  try {
+    const { period = "all" } = req.query;
+
+    const cacheKey = `verification_stats:${period}`;
+    let cachedStats = await redisService.getJSON(cacheKey);
+
+    if (cachedStats) {
+      return res.status(200).json({
+        success: true,
+        message: "Verification statistics retrieved successfully",
+        data: cachedStats,
+        meta: {
+          cached: true,
+          executionTime: Math.round(performance.now() - startTime),
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+
+    const statsKey = "verification_stats";
+    const redisStats = await redisService.hgetall(statsKey);
+
+    const dbStats = await prisma.instructor.aggregate({
+      _count: {
+        id: true,
+      },
+      where: {
+        isVerified: true,
+      },
+    });
+
+    const totalInstructors = await prisma.instructor.count();
+
+    const verificationsByLevel = await prisma.instructor.groupBy({
+      by: ["verificationBadge"],
+      where: {
+        isVerified: true,
+        verificationBadge: { not: null },
+      },
+      _count: {
+        verificationBadge: true,
+      },
+    });
+
+    const stats = {
+      overview: {
+        totalRequests: parseInt(redisStats.total_requests || 0),
+        pendingRequests: parseInt(redisStats.pending_requests || 0),
+        approvedRequests: parseInt(redisStats.approved_requests || 0),
+        rejectedRequests: parseInt(redisStats.rejected_requests || 0),
+        cancelledRequests: parseInt(redisStats.cancelled_requests || 0),
+        totalInstructors,
+        verifiedInstructors: dbStats._count.id,
+        verificationRate:
+          totalInstructors > 0
+            ? ((dbStats._count.id / totalInstructors) * 100).toFixed(2)
+            : 0,
+      },
+      byLevel: {
+        basic: parseInt(redisStats.level_basic || 0),
+        expert: parseInt(redisStats.level_expert || 0),
+        premium: parseInt(redisStats.level_premium || 0),
+        industry: parseInt(redisStats.level_industry || 0),
+      },
+      verificationDistribution: verificationsByLevel.reduce(
+        (acc, item) => {
+          const level = item.verificationBadge.toLowerCase().includes("expert")
+            ? "expert"
+            : item.verificationBadge.toLowerCase().includes("premium")
+            ? "premium"
+            : item.verificationBadge.toLowerCase().includes("industry")
+            ? "industry"
+            : "basic";
+          acc[level] = item._count.verificationBadge;
+          return acc;
+        },
+        { basic: 0, expert: 0, premium: 0, industry: 0 }
+      ),
+      performance: {
+        averageReviewTime: "2.5 days",
+        approvalRate:
+          redisStats.total_requests > 0
+            ? (
+                (parseInt(redisStats.approved_requests || 0) /
+                  parseInt(redisStats.total_requests)) *
+                100
+              ).toFixed(2)
+            : 0,
+        rejectionRate:
+          redisStats.total_requests > 0
+            ? (
+                (parseInt(redisStats.rejected_requests || 0) /
+                  parseInt(redisStats.total_requests)) *
+                100
+              ).toFixed(2)
+            : 0,
+      },
+    };
+
+    await redisService.setJSON(cacheKey, stats, { ex: 600 });
+
+    const executionTime = Math.round(performance.now() - startTime);
+
+    res.status(200).json({
+      success: true,
+      message: "Verification statistics retrieved successfully",
+      data: stats,
+      meta: {
+        cached: false,
+        executionTime,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("Get verification stats error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve verification statistics",
       code: "INTERNAL_SERVER_ERROR",
       meta: {
         executionTime: Math.round(performance.now() - startTime),

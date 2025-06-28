@@ -11,6 +11,11 @@ import rateLimit from "express-rate-limit";
 import slowDown from "express-slow-down";
 import socketManager from "./utils/socket-io.js";
 import redisService from "./utils/redis.js";
+import {
+  handleUnifiedWebhook,
+  getWebhookStatus,
+  testWebhook,
+} from "./controllers/webhooks/unifiedWebhook.controller.js";
 import authRoutes from "./routes/common/auth.route.js";
 import notificationRoutes from "./routes/common/notification.route.js";
 import uploadRoutes from "./routes/common/upload.route.js";
@@ -48,6 +53,7 @@ import {
   authErrorHandler,
 } from "./middlewares/errorHandler.js";
 import "./utils/passport.js";
+
 config();
 
 const corsOptions = {
@@ -117,6 +123,18 @@ app.use(
     },
   })
 );
+
+try {
+  const initializeBackgroundJobs = await import(
+    "./config/services/courseCountJobs.js"
+  ).then((module) => module.default);
+  initializeBackgroundJobs();
+} catch (error) {
+  console.warn("Background jobs initialization failed:", error.message);
+  console.log(
+    "Server will continue without background jobs - database triggers will handle count updates"
+  );
+}
 
 app.use(compression());
 
@@ -218,6 +236,21 @@ const apiSlowDown = slowDown({
 
 app.use(cors(corsOptions));
 
+const io = socketManager.init(server);
+
+app.set("socketManager", socketManager);
+app.set("redisService", redisService);
+
+app.post(
+  "/api/webhook/payment",
+  express.raw({ type: "application/json" }),
+  handleUnifiedWebhook
+);
+
+app.get("/api/webhook/payment/status", getWebhookStatus);
+
+app.post("/api/webhook/payment/test", express.json(), testWebhook);
+
 app.use(
   express.json({
     limit: "10mb",
@@ -275,11 +308,6 @@ app.use(userIdMiddleware);
 
 app.use(globalRateLimit);
 app.use(apiSlowDown);
-
-const io = socketManager.init(server);
-
-app.set("socketManager", socketManager);
-app.set("redisService", redisService);
 
 app.get("/", (req, res) => {
   res.json({
@@ -360,48 +388,6 @@ app.use("/api/student/community", authRateLimit, studentCommunityRoutes);
 app.use("/api/student/learning", authRateLimit, studentLearningRoutes);
 app.use("/api/student/purchase", authRateLimit, studentPurchaseRoutes);
 app.use("/api/student/wishlist", authRateLimit, studentWishlistRoutes);
-
-app.post(
-  "/api/webhook/payment",
-  express.raw({ type: "application/json" }),
-  (req, res) => {
-    try {
-      const signature =
-        req.headers["stripe-signature"] || req.headers["razorpay-signature"];
-
-      if (!signature) {
-        return res.status(400).send("Missing signature");
-      }
-
-      const event = req.body;
-
-      switch (event.type) {
-        case "payment_intent.succeeded":
-        case "checkout.session.completed":
-          socketManager.notifyPaymentSuccess(
-            event.data.object.metadata.userId,
-            {
-              paymentId: event.data.object.id,
-              amount: event.data.object.amount,
-              currency: event.data.object.currency,
-            }
-          );
-          break;
-        case "payment_intent.payment_failed":
-          socketManager.notifyPaymentFailed(event.data.object.metadata.userId, {
-            paymentId: event.data.object.id,
-            reason: event.data.object.last_payment_error?.message,
-          });
-          break;
-      }
-
-      res.json({ received: true });
-    } catch (error) {
-      console.error("Webhook error:", error);
-      res.status(400).send(`Webhook Error: ${error.message}`);
-    }
-  }
-);
 
 app.use((req, res, next) => {
   req.redisService = redisService;
@@ -532,6 +518,7 @@ server.listen(PORT, () => {
   console.log(`🚦 Rate limiting: enabled`);
   console.log("🔌 Socket.IO server ready for connections");
   console.log(`⚡ Ping timeout: 60000ms, interval: 25000ms`);
+  console.log(`🎯 Unified webhook endpoint: /api/webhook/payment`);
 
   if (process.env.NODE_ENV === "production") {
     console.log("🔒 Production security features enabled");

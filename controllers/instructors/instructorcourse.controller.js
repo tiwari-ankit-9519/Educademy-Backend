@@ -1,8 +1,9 @@
 import { PrismaClient } from "@prisma/client";
 import redisService from "../../utils/redis.js";
 import emailService from "../../utils/emailService.js";
-import notificationService from "../../utils/notificationService.js";
+import notificationService from "../../utils/notificationservice.js";
 import asyncHandler from "express-async-handler";
+import { deleteFromCloudinary } from "../../config/upload.js";
 
 const prisma = new PrismaClient();
 
@@ -32,11 +33,12 @@ const createCourse = asyncHandler(async (req, res) => {
       level,
       price,
       discountPrice,
+      discountPercentage,
       language = "English",
-      requirements = [],
-      learningOutcomes = [],
-      targetAudience = [],
-      tags = [],
+      requirements = "[]",
+      learningOutcomes = "[]",
+      targetAudience = "[]",
+      tags = "[]",
     } = req.body;
 
     if (
@@ -47,6 +49,14 @@ const createCourse = asyncHandler(async (req, res) => {
       !level ||
       !price
     ) {
+      if (req.file?.path) {
+        setImmediate(() =>
+          deleteFromCloudinary(
+            req.file.path.split("/").slice(-2).join("/").split(".")[0],
+            "image"
+          )
+        );
+      }
       return res.status(400).json({
         success: false,
         message: "Missing required fields",
@@ -62,7 +72,41 @@ const createCourse = asyncHandler(async (req, res) => {
       });
     }
 
-    if (parseFloat(price) < 0) {
+    const parseArrayField = (field) => {
+      if (Array.isArray(field)) return field;
+      if (typeof field === "string") {
+        try {
+          const parsed = JSON.parse(field);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      }
+      return [];
+    };
+
+    const [
+      parsedRequirements,
+      parsedLearningOutcomes,
+      parsedTargetAudience,
+      parsedTags,
+    ] = [
+      parseArrayField(requirements),
+      parseArrayField(learningOutcomes),
+      parseArrayField(targetAudience),
+      parseArrayField(tags),
+    ];
+
+    const priceFloat = parseFloat(price);
+    if (priceFloat < 0) {
+      if (req.file?.path) {
+        setImmediate(() =>
+          deleteFromCloudinary(
+            req.file.path.split("/").slice(-2).join("/").split(".")[0],
+            "image"
+          )
+        );
+      }
       return res.status(400).json({
         success: false,
         message: "Price cannot be negative",
@@ -70,20 +114,99 @@ const createCourse = asyncHandler(async (req, res) => {
       });
     }
 
-    if (discountPrice && parseFloat(discountPrice) >= parseFloat(price)) {
-      return res.status(400).json({
+    let finalDiscountPrice = null;
+    let finalDiscountPercentage = null;
+
+    if (discountPrice) {
+      finalDiscountPrice = parseFloat(discountPrice);
+      if (finalDiscountPrice >= priceFloat) {
+        if (req.file?.path) {
+          setImmediate(() =>
+            deleteFromCloudinary(
+              req.file.path.split("/").slice(-2).join("/").split(".")[0],
+              "image"
+            )
+          );
+        }
+        return res.status(400).json({
+          success: false,
+          message: "Discount price must be less than original price",
+          code: "INVALID_DISCOUNT",
+        });
+      }
+    } else if (discountPercentage) {
+      const discountPercent = parseFloat(discountPercentage);
+      if (discountPercent <= 0 || discountPercent >= 100) {
+        if (req.file?.path) {
+          setImmediate(() =>
+            deleteFromCloudinary(
+              req.file.path.split("/").slice(-2).join("/").split(".")[0],
+              "image"
+            )
+          );
+        }
+        return res.status(400).json({
+          success: false,
+          message: "Discount percentage must be between 1 and 99",
+          code: "INVALID_DISCOUNT_PERCENTAGE",
+        });
+      }
+      finalDiscountPercentage = discountPercent;
+      finalDiscountPrice = priceFloat * (1 - finalDiscountPercentage / 100);
+    }
+
+    const baseSlug = generateCourseSlug(title);
+    const timestamp = Date.now();
+    const slug = `${baseSlug}-${timestamp}`;
+
+    const validationQueries = [
+      prisma.instructor.findUnique({
+        where: { userId: req.userAuthId },
+        select: { id: true, totalCourses: true },
+      }),
+      prisma.category.findUnique({
+        where: { id: categoryId },
+        select: { id: true, name: true, slug: true },
+      }),
+    ];
+
+    if (subcategoryId) {
+      validationQueries.push(
+        prisma.category.findUnique({
+          where: { id: subcategoryId, parentId: categoryId },
+          select: { id: true, name: true, slug: true },
+        })
+      );
+    }
+
+    const results = await Promise.all(validationQueries);
+    const [instructor, category, subcategory] = results;
+
+    if (!instructor) {
+      if (req.file?.path) {
+        setImmediate(() =>
+          deleteFromCloudinary(
+            req.file.path.split("/").slice(-2).join("/").split(".")[0],
+            "image"
+          )
+        );
+      }
+      return res.status(404).json({
         success: false,
-        message: "Discount price must be less than original price",
-        code: "INVALID_DISCOUNT",
+        message: "Instructor profile not found",
+        code: "INSTRUCTOR_NOT_FOUND",
       });
     }
 
-    const category = await prisma.category.findUnique({
-      where: { id: categoryId },
-      select: { id: true, name: true },
-    });
-
     if (!category) {
+      if (req.file?.path) {
+        setImmediate(() =>
+          deleteFromCloudinary(
+            req.file.path.split("/").slice(-2).join("/").split(".")[0],
+            "image"
+          )
+        );
+      }
       return res.status(404).json({
         success: false,
         message: "Category not found",
@@ -91,94 +214,104 @@ const createCourse = asyncHandler(async (req, res) => {
       });
     }
 
-    if (subcategoryId) {
-      const subcategory = await prisma.category.findUnique({
-        where: { id: subcategoryId, parentId: categoryId },
-        select: { id: true, name: true },
-      });
-
-      if (!subcategory) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Subcategory not found or doesn't belong to selected category",
-          code: "SUBCATEGORY_NOT_FOUND",
-        });
+    if (subcategoryId && !subcategory) {
+      if (req.file?.path) {
+        setImmediate(() =>
+          deleteFromCloudinary(
+            req.file.path.split("/").slice(-2).join("/").split(".")[0],
+            "image"
+          )
+        );
       }
+      return res.status(404).json({
+        success: false,
+        message: "Subcategory not found or doesn't belong to selected category",
+        code: "SUBCATEGORY_NOT_FOUND",
+      });
     }
 
-    const baseSlug = generateCourseSlug(title);
-    let slug = baseSlug;
-    let counter = 1;
+    const thumbnail = req.file?.path || null;
 
-    while (await prisma.course.findUnique({ where: { slug } })) {
-      slug = `${baseSlug}-${counter}`;
-      counter++;
-    }
-
-    const instructor = await prisma.instructor.findUnique({
-      where: { userId: req.userAuthId },
-      select: { id: true, totalCourses: true },
-    });
+    const courseData = {
+      title,
+      slug,
+      description,
+      shortDescription,
+      categoryId,
+      subcategoryId,
+      level,
+      price: priceFloat,
+      discountPrice: finalDiscountPrice,
+      discountPercentage: finalDiscountPercentage,
+      originalPrice: priceFloat,
+      language,
+      requirements: parsedRequirements,
+      learningOutcomes: parsedLearningOutcomes,
+      targetAudience: parsedTargetAudience,
+      tags: parsedTags,
+      thumbnail,
+      duration: 0,
+      status: "DRAFT",
+      instructorId: instructor.id,
+      sectionsCount: 0,
+      publishedSectionsCount: 0,
+      enrollmentsCount: 0,
+      reviewsCount: 0,
+    };
 
     const course = await prisma.course.create({
-      data: {
-        title,
-        slug,
-        description,
-        shortDescription,
-        categoryId,
-        subcategoryId,
-        level,
-        price: parseFloat(price),
-        discountPrice: discountPrice ? parseFloat(discountPrice) : null,
-        originalPrice: parseFloat(price),
-        language,
-        requirements,
-        learningOutcomes,
-        targetAudience,
-        tags,
-        duration: 0,
-        status: "DRAFT",
-        instructorId: instructor.id,
-      },
-      include: {
-        instructor: {
-          include: {
-            user: {
-              select: {
-                firstName: true,
-                lastName: true,
-                profileImage: true,
-              },
-            },
-          },
-        },
-        category: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
-          },
-        },
-        subcategory: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
-          },
-        },
+      data: courseData,
+      select: {
+        id: true,
+        title: true,
+        slug: true,
+        description: true,
+        shortDescription: true,
+        thumbnail: true,
+        price: true,
+        discountPrice: true,
+        discountPercentage: true,
+        level: true,
+        status: true,
+        language: true,
+        requirements: true,
+        learningOutcomes: true,
+        targetAudience: true,
+        tags: true,
+        createdAt: true,
+        updatedAt: true,
       },
     });
 
-    await prisma.instructor.update({
+    const instructorData = await prisma.instructor.findUnique({
       where: { id: instructor.id },
-      data: { totalCourses: instructor.totalCourses + 1 },
+      select: {
+        id: true,
+        user: {
+          select: {
+            firstName: true,
+            lastName: true,
+            profileImage: true,
+          },
+        },
+      },
     });
 
-    const cacheKey = `instructor_courses:${req.userAuthId}`;
-    await redisService.del(cacheKey);
-    await redisService.delPattern(`course:${course.id}*`);
+    setImmediate(async () => {
+      try {
+        await Promise.all([
+          prisma.instructor.update({
+            where: { id: instructor.id },
+            data: { totalCourses: instructor.totalCourses + 1 },
+          }),
+          redisService.del(`courses:${req.userAuthId}`),
+          redisService.delPattern(`courses:${req.userAuthId}:*`),
+          redisService.del(`instructor:${req.userAuthId}`),
+        ]);
+      } catch (error) {
+        console.warn("Background operations failed:", error);
+      }
+    });
 
     const executionTime = performance.now() - startTime;
 
@@ -187,29 +320,14 @@ const createCourse = asyncHandler(async (req, res) => {
       message: "Course created successfully",
       data: {
         course: {
-          id: course.id,
-          title: course.title,
-          slug: course.slug,
-          description: course.description,
-          shortDescription: course.shortDescription,
-          price: course.price,
-          discountPrice: course.discountPrice,
-          level: course.level,
-          status: course.status,
-          language: course.language,
-          requirements: course.requirements,
-          learningOutcomes: course.learningOutcomes,
-          targetAudience: course.targetAudience,
-          tags: course.tags,
-          category: course.category,
-          subcategory: course.subcategory,
+          ...course,
+          category,
+          subcategory,
           instructor: {
-            id: course.instructor.id,
-            name: `${course.instructor.user.firstName} ${course.instructor.user.lastName}`,
-            profileImage: course.instructor.user.profileImage,
+            id: instructorData.id,
+            name: `${instructorData.user.firstName} ${instructorData.user.lastName}`,
+            profileImage: instructorData.user.profileImage,
           },
-          createdAt: course.createdAt,
-          updatedAt: course.updatedAt,
         },
       },
       meta: {
@@ -219,6 +337,15 @@ const createCourse = asyncHandler(async (req, res) => {
       },
     });
   } catch (error) {
+    if (req.file?.path) {
+      setImmediate(() =>
+        deleteFromCloudinary(
+          req.file.path.split("/").slice(-2).join("/").split(".")[0],
+          "image"
+        )
+      );
+    }
+
     console.error(`CREATE_COURSE_ERROR [${requestId}]:`, {
       error: error.message,
       stack: error.stack,
@@ -255,37 +382,43 @@ const getCourses = asyncHandler(async (req, res) => {
       search,
       sortBy = "updatedAt",
       sortOrder = "desc",
+      cursor,
+      useCursor = "true",
     } = req.query;
 
     const pageSize = Math.min(parseInt(limit), 50);
     const pageNumber = Math.max(parseInt(page), 1);
-    const skip = (pageNumber - 1) * pageSize;
+    const shouldUseCursor = useCursor === "true";
 
-    const cacheKey = `instructor_courses:${req.userAuthId}:${JSON.stringify({
-      page: pageNumber,
-      limit: pageSize,
-      status,
-      level,
-      categoryId,
-      search,
-      sortBy,
-      sortOrder,
-    })}`;
+    const cacheKey = `courses:${req.userAuthId}:${
+      shouldUseCursor ? "cursor" : "offset"
+    }:${pageSize}:${status || ""}:${level || ""}:${categoryId || ""}:${
+      search || ""
+    }:${sortBy}:${sortOrder}:${cursor || page}`;
 
-    let cachedResult = await redisService.getJSON(cacheKey);
+    let cachedResult = await redisService.get(cacheKey);
     if (cachedResult) {
-      const executionTime = performance.now() - startTime;
-      return res.status(200).json({
-        success: true,
-        message: "Courses retrieved successfully",
-        data: cachedResult,
-        meta: {
-          requestId,
-          executionTime: Math.round(executionTime),
-          timestamp: new Date().toISOString(),
-          cacheHit: true,
-        },
-      });
+      try {
+        const parsedResult =
+          typeof cachedResult === "string"
+            ? JSON.parse(cachedResult)
+            : cachedResult;
+        const executionTime = performance.now() - startTime;
+        return res.status(200).json({
+          success: true,
+          message: "Courses retrieved successfully",
+          data: parsedResult,
+          meta: {
+            requestId,
+            executionTime: Math.round(executionTime),
+            timestamp: new Date().toISOString(),
+            cacheHit: true,
+          },
+        });
+      } catch (parseError) {
+        console.warn("Cache parse error, invalidating cache:", parseError);
+        await redisService.del(cacheKey);
+      }
     }
 
     const instructor = await prisma.instructor.findUnique({
@@ -301,56 +434,118 @@ const getCourses = asyncHandler(async (req, res) => {
       });
     }
 
-    const where = {
+    let whereClause = {
       instructorId: instructor.id,
+      status: {
+        not: "ARCHIVED",
+      },
     };
 
-    if (status) {
-      where.status = status;
-    }
-
-    if (level) {
-      where.level = level;
-    }
-
-    if (categoryId) {
-      where.categoryId = categoryId;
-    }
-
+    if (status) whereClause.status = status;
+    if (level) whereClause.level = level;
+    if (categoryId) whereClause.categoryId = categoryId;
     if (search) {
-      where.OR = [
+      whereClause.OR = [
         { title: { contains: search, mode: "insensitive" } },
-        { description: { contains: search, mode: "insensitive" } },
         { shortDescription: { contains: search, mode: "insensitive" } },
-        { tags: { has: search } },
+        { slug: { contains: search, mode: "insensitive" } },
+        { id: { equals: search } },
+        { id: { contains: search, mode: "insensitive" } },
       ];
     }
 
-    const validSortFields = [
-      "title",
-      "createdAt",
-      "updatedAt",
-      "publishedAt",
-      "price",
-      "averageRating",
-      "totalEnrollments",
-      "status",
-    ];
+    if (shouldUseCursor && cursor) {
+      try {
+        const cursorData = JSON.parse(Buffer.from(cursor, "base64").toString());
 
-    const orderBy = {};
-    if (validSortFields.includes(sortBy)) {
-      orderBy[sortBy] = sortOrder === "asc" ? "asc" : "desc";
-    } else {
-      orderBy.updatedAt = "desc";
+        if (sortBy === "updatedAt") {
+          whereClause.updatedAt =
+            sortOrder === "desc"
+              ? { lt: new Date(cursorData.updatedAt) }
+              : { gt: new Date(cursorData.updatedAt) };
+        } else if (sortBy === "createdAt") {
+          whereClause.createdAt =
+            sortOrder === "desc"
+              ? { lt: new Date(cursorData.createdAt) }
+              : { gt: new Date(cursorData.createdAt) };
+        } else if (sortBy === "title") {
+          whereClause.title =
+            sortOrder === "desc"
+              ? { lt: cursorData.title }
+              : { gt: cursorData.title };
+        } else if (sortBy === "price") {
+          whereClause.price =
+            sortOrder === "desc"
+              ? { lt: cursorData.price }
+              : { gt: cursorData.price };
+        } else if (sortBy === "averageRating") {
+          whereClause.averageRating =
+            sortOrder === "desc"
+              ? { lt: cursorData.averageRating }
+              : { gt: cursorData.averageRating };
+        } else if (sortBy === "totalEnrollments") {
+          whereClause.totalEnrollments =
+            sortOrder === "desc"
+              ? { lt: cursorData.totalEnrollments }
+              : { gt: cursorData.totalEnrollments };
+        }
+      } catch (error) {
+        console.warn("Invalid cursor, falling back to first page");
+      }
     }
 
-    const [courses, total] = await Promise.all([
+    const validSortFields = {
+      title: "title",
+      createdAt: "createdAt",
+      updatedAt: "updatedAt",
+      publishedAt: "publishedAt",
+      price: "price",
+      averageRating: "averageRating",
+      totalEnrollments: "totalEnrollments",
+    };
+
+    const orderBy = {};
+    const sortField = validSortFields[sortBy] || "updatedAt";
+    orderBy[sortField] = sortOrder === "asc" ? "asc" : "desc";
+
+    const skip = shouldUseCursor ? 0 : (pageNumber - 1) * pageSize;
+    const take = shouldUseCursor ? pageSize + 1 : pageSize;
+
+    const [courses, total, summary] = await Promise.all([
       prisma.course.findMany({
-        where,
+        where: whereClause,
         orderBy,
         skip,
-        take: pageSize,
-        include: {
+        take,
+        select: {
+          id: true,
+          title: true,
+          slug: true,
+          shortDescription: true,
+          thumbnail: true,
+          price: true,
+          discountPrice: true,
+          level: true,
+          status: true,
+          language: true,
+          duration: true,
+          averageRating: true,
+          totalRatings: true,
+          totalEnrollments: true,
+          totalRevenue: true,
+          featured: true,
+          bestseller: true,
+          trending: true,
+          lastUpdated: true,
+          createdAt: true,
+          updatedAt: true,
+          publishedAt: true,
+          reviewSubmittedAt: true,
+          rejectionReason: true,
+          sectionsCount: true,
+          publishedSectionsCount: true,
+          enrollmentsCount: true,
+          reviewsCount: true,
           category: {
             select: {
               id: true,
@@ -365,26 +560,48 @@ const getCourses = asyncHandler(async (req, res) => {
               slug: true,
             },
           },
-          sections: {
-            select: {
-              id: true,
-              title: true,
-              order: true,
-              isPublished: true,
-            },
-            orderBy: { order: "asc" },
-          },
-          _count: {
-            select: {
-              enrollments: true,
-              reviews: true,
-              sections: true,
-            },
-          },
         },
       }),
-      prisma.course.count({ where }),
+      shouldUseCursor
+        ? Promise.resolve(null)
+        : prisma.course.count({ where: whereClause }),
+      prisma.course.groupBy({
+        by: ["status"],
+        where: {
+          instructorId: instructor.id,
+          status: {
+            not: "ARCHIVED",
+          },
+        },
+        _count: { status: true },
+      }),
     ]);
+
+    let hasMore = false;
+    let nextCursor = null;
+
+    if (shouldUseCursor) {
+      hasMore = courses.length > pageSize;
+      if (hasMore) {
+        courses.pop();
+        const lastCourse = courses[courses.length - 1];
+        if (lastCourse) {
+          const cursorData = {
+            id: lastCourse.id,
+            [sortField]: lastCourse[sortField],
+          };
+          nextCursor = Buffer.from(JSON.stringify(cursorData)).toString(
+            "base64"
+          );
+        }
+      }
+    }
+
+    const summaryMap = summary.reduce((acc, item) => {
+      const statusKey = item.status.toLowerCase().replace("_", "") + "Courses";
+      acc[statusKey] = item._count.status;
+      return acc;
+    }, {});
 
     const result = {
       courses: courses.map((course) => ({
@@ -393,25 +610,27 @@ const getCourses = asyncHandler(async (req, res) => {
         slug: course.slug,
         shortDescription: course.shortDescription,
         thumbnail: course.thumbnail,
-        price: course.price,
-        discountPrice: course.discountPrice,
+        price: parseFloat(course.price) || 0,
+        discountPrice: course.discountPrice
+          ? parseFloat(course.discountPrice)
+          : null,
         level: course.level,
         status: course.status,
         language: course.language,
         duration: course.duration,
-        averageRating: course.averageRating,
+        averageRating: parseFloat(course.averageRating) || 0,
         totalRatings: course.totalRatings,
         totalEnrollments: course.totalEnrollments,
-        totalRevenue: course.totalRevenue,
+        totalRevenue: parseFloat(course.totalRevenue) || 0,
         featured: course.featured,
         bestseller: course.bestseller,
         trending: course.trending,
         category: course.category,
         subcategory: course.subcategory,
-        sectionsCount: course._count.sections,
-        enrollmentsCount: course._count.enrollments,
-        reviewsCount: course._count.reviews,
-        publishedSections: course.sections.filter((s) => s.isPublished).length,
+        sectionsCount: course.sectionsCount || 0,
+        enrollmentsCount: course.enrollmentsCount || 0,
+        reviewsCount: course.reviewsCount || 0,
+        publishedSections: course.publishedSectionsCount || 0,
         lastUpdated: course.lastUpdated,
         createdAt: course.createdAt,
         updatedAt: course.updatedAt,
@@ -419,26 +638,36 @@ const getCourses = asyncHandler(async (req, res) => {
         reviewSubmittedAt: course.reviewSubmittedAt,
         rejectionReason: course.rejectionReason,
       })),
-      pagination: {
-        page: pageNumber,
-        limit: pageSize,
-        total,
-        totalPages: Math.ceil(total / pageSize),
-        hasNext: skip + pageSize < total,
-        hasPrev: pageNumber > 1,
-      },
+      pagination: shouldUseCursor
+        ? {
+            limit: pageSize,
+            hasMore,
+            nextCursor,
+            useCursor: true,
+          }
+        : {
+            page: pageNumber,
+            limit: pageSize,
+            total,
+            totalPages: Math.ceil(total / pageSize),
+            hasNext: skip + pageSize < total,
+            hasPrev: pageNumber > 1,
+            useCursor: false,
+          },
       summary: {
-        totalCourses: total,
-        draftCourses: courses.filter((c) => c.status === "DRAFT").length,
-        underReviewCourses: courses.filter((c) => c.status === "UNDER_REVIEW")
-          .length,
-        publishedCourses: courses.filter((c) => c.status === "PUBLISHED")
-          .length,
-        rejectedCourses: courses.filter((c) => c.status === "REJECTED").length,
+        totalCourses: shouldUseCursor ? null : total,
+        draftCourses: summaryMap.draftcourses || 0,
+        underReviewCourses: summaryMap.underreviewcourses || 0,
+        publishedCourses: summaryMap.publishedcourses || 0,
+        rejectedCourses: summaryMap.rejectedcourses || 0,
       },
     };
 
-    await redisService.setJSON(cacheKey, result, { ex: 300 });
+    try {
+      await redisService.setex(cacheKey, 120, JSON.stringify(result));
+    } catch (cacheError) {
+      console.warn("Failed to cache result:", cacheError);
+    }
 
     const executionTime = performance.now() - startTime;
 
@@ -722,6 +951,19 @@ const updateCourse = asyncHandler(async (req, res) => {
     const updateData = req.body;
 
     if (!courseId) {
+      if (req.file && req.file.path) {
+        try {
+          const publicId = req.file.path
+            .split("/")
+            .slice(-2)
+            .join("/")
+            .split(".")[0];
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error("Error deleting uploaded thumbnail:", deleteError);
+        }
+      }
+
       return res.status(400).json({
         success: false,
         message: "Course ID is required",
@@ -744,10 +986,25 @@ const updateCourse = asyncHandler(async (req, res) => {
         status: true,
         title: true,
         slug: true,
+        thumbnail: true,
+        price: true,
       },
     });
 
     if (!existingCourse) {
+      if (req.file && req.file.path) {
+        try {
+          const publicId = req.file.path
+            .split("/")
+            .slice(-2)
+            .join("/")
+            .split(".")[0];
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error("Error deleting uploaded thumbnail:", deleteError);
+        }
+      }
+
       return res.status(404).json({
         success: false,
         message: "Course not found or you don't have permission to update it",
@@ -759,6 +1016,19 @@ const updateCourse = asyncHandler(async (req, res) => {
       existingCourse.status === "PUBLISHED" &&
       updateData.status !== "ARCHIVED"
     ) {
+      if (req.file && req.file.path) {
+        try {
+          const publicId = req.file.path
+            .split("/")
+            .slice(-2)
+            .join("/")
+            .split(".")[0];
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error("Error deleting uploaded thumbnail:", deleteError);
+        }
+      }
+
       return res.status(403).json({
         success: false,
         message:
@@ -768,6 +1038,19 @@ const updateCourse = asyncHandler(async (req, res) => {
     }
 
     if (existingCourse.status === "UNDER_REVIEW") {
+      if (req.file && req.file.path) {
+        try {
+          const publicId = req.file.path
+            .split("/")
+            .slice(-2)
+            .join("/")
+            .split(".")[0];
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error("Error deleting uploaded thumbnail:", deleteError);
+        }
+      }
+
       return res.status(403).json({
         success: false,
         message: "Course is currently under review and cannot be edited",
@@ -779,11 +1062,11 @@ const updateCourse = asyncHandler(async (req, res) => {
       "title",
       "description",
       "shortDescription",
-      "thumbnail",
       "previewVideo",
       "introVideo",
       "price",
       "discountPrice",
+      "discountPercentage",
       "level",
       "language",
       "subtitles",
@@ -797,13 +1080,84 @@ const updateCourse = asyncHandler(async (req, res) => {
     ];
 
     const filteredData = {};
-    Object.keys(updateData).forEach((key) => {
-      if (allowedFields.includes(key) && updateData[key] !== undefined) {
-        filteredData[key] = updateData[key];
+
+    for (const [key, value] of Object.entries(updateData)) {
+      if (allowedFields.includes(key) && value !== undefined) {
+        // Parse JSON strings for array fields
+        if (
+          [
+            "requirements",
+            "learningOutcomes",
+            "targetAudience",
+            "tags",
+            "keyPoints",
+            "subtitles",
+          ].includes(key)
+        ) {
+          try {
+            filteredData[key] = Array.isArray(value)
+              ? value
+              : JSON.parse(value || "[]");
+          } catch (parseError) {
+            if (req.file && req.file.path) {
+              try {
+                const publicId = req.file.path
+                  .split("/")
+                  .slice(-2)
+                  .join("/")
+                  .split(".")[0];
+                await deleteFromCloudinary(publicId, "image");
+              } catch (deleteError) {
+                console.error(
+                  "Error deleting uploaded thumbnail:",
+                  deleteError
+                );
+              }
+            }
+
+            return res.status(400).json({
+              success: false,
+              message: `Invalid JSON format in field: ${key}`,
+              code: "INVALID_JSON_FORMAT",
+            });
+          }
+        } else {
+          filteredData[key] = value;
+        }
       }
-    });
+    }
+
+    if (req.file) {
+      filteredData.thumbnail = req.file.path;
+
+      if (existingCourse.thumbnail) {
+        try {
+          const publicId = existingCourse.thumbnail
+            .split("/")
+            .slice(-2)
+            .join("/")
+            .split(".")[0];
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error("Error deleting old thumbnail:", deleteError);
+        }
+      }
+    }
 
     if (Object.keys(filteredData).length === 0) {
+      if (req.file && req.file.path) {
+        try {
+          const publicId = req.file.path
+            .split("/")
+            .slice(-2)
+            .join("/")
+            .split(".")[0];
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error("Error deleting uploaded thumbnail:", deleteError);
+        }
+      }
+
       return res.status(400).json({
         success: false,
         message: "No valid fields to update",
@@ -812,6 +1166,19 @@ const updateCourse = asyncHandler(async (req, res) => {
     }
 
     if (filteredData.price && parseFloat(filteredData.price) < 0) {
+      if (req.file && req.file.path) {
+        try {
+          const publicId = req.file.path
+            .split("/")
+            .slice(-2)
+            .join("/")
+            .split(".")[0];
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error("Error deleting uploaded thumbnail:", deleteError);
+        }
+      }
+
       return res.status(400).json({
         success: false,
         message: "Price cannot be negative",
@@ -819,11 +1186,68 @@ const updateCourse = asyncHandler(async (req, res) => {
       });
     }
 
-    if (
-      filteredData.discountPrice &&
-      filteredData.price &&
-      parseFloat(filteredData.discountPrice) >= parseFloat(filteredData.price)
-    ) {
+    const coursePrice = filteredData.price
+      ? parseFloat(filteredData.price)
+      : existingCourse.price;
+    let finalDiscountPrice = null;
+    let finalDiscountPercentage = null;
+
+    if (filteredData.discountPrice !== undefined) {
+      if (filteredData.discountPrice) {
+        finalDiscountPrice = parseFloat(filteredData.discountPrice);
+        filteredData.discountPercentage = null;
+      } else {
+        filteredData.discountPrice = null;
+        filteredData.discountPercentage = null;
+      }
+    } else if (filteredData.discountPercentage !== undefined) {
+      if (filteredData.discountPercentage) {
+        if (
+          filteredData.discountPercentage <= 0 ||
+          filteredData.discountPercentage >= 100
+        ) {
+          if (req.file && req.file.path) {
+            try {
+              const publicId = req.file.path
+                .split("/")
+                .slice(-2)
+                .join("/")
+                .split(".")[0];
+              await deleteFromCloudinary(publicId, "image");
+            } catch (deleteError) {
+              console.error("Error deleting uploaded thumbnail:", deleteError);
+            }
+          }
+
+          return res.status(400).json({
+            success: false,
+            message: "Discount percentage must be between 1 and 99",
+            code: "INVALID_DISCOUNT_PERCENTAGE",
+          });
+        }
+        finalDiscountPercentage = parseFloat(filteredData.discountPercentage);
+        finalDiscountPrice = coursePrice * (1 - finalDiscountPercentage / 100);
+        filteredData.discountPrice = finalDiscountPrice;
+      } else {
+        filteredData.discountPrice = null;
+        filteredData.discountPercentage = null;
+      }
+    }
+
+    if (finalDiscountPrice && finalDiscountPrice >= coursePrice) {
+      if (req.file && req.file.path) {
+        try {
+          const publicId = req.file.path
+            .split("/")
+            .slice(-2)
+            .join("/")
+            .split(".")[0];
+          await deleteFromCloudinary(publicId, "image");
+        } catch (deleteError) {
+          console.error("Error deleting uploaded thumbnail:", deleteError);
+        }
+      }
+
       return res.status(400).json({
         success: false,
         message: "Discount price must be less than original price",
@@ -854,6 +1278,19 @@ const updateCourse = asyncHandler(async (req, res) => {
       });
 
       if (!category) {
+        if (req.file && req.file.path) {
+          try {
+            const publicId = req.file.path
+              .split("/")
+              .slice(-2)
+              .join("/")
+              .split(".")[0];
+            await deleteFromCloudinary(publicId, "image");
+          } catch (deleteError) {
+            console.error("Error deleting uploaded thumbnail:", deleteError);
+          }
+        }
+
         return res.status(404).json({
           success: false,
           message: "Category not found",
@@ -872,6 +1309,19 @@ const updateCourse = asyncHandler(async (req, res) => {
       });
 
       if (!subcategory) {
+        if (req.file && req.file.path) {
+          try {
+            const publicId = req.file.path
+              .split("/")
+              .slice(-2)
+              .join("/")
+              .split(".")[0];
+            await deleteFromCloudinary(publicId, "image");
+          } catch (deleteError) {
+            console.error("Error deleting uploaded thumbnail:", deleteError);
+          }
+        }
+
         return res.status(404).json({
           success: false,
           message:
@@ -883,10 +1333,6 @@ const updateCourse = asyncHandler(async (req, res) => {
 
     if (filteredData.price) {
       filteredData.price = parseFloat(filteredData.price);
-    }
-
-    if (filteredData.discountPrice) {
-      filteredData.discountPrice = parseFloat(filteredData.discountPrice);
     }
 
     filteredData.lastUpdated = new Date();
@@ -944,6 +1390,7 @@ const updateCourse = asyncHandler(async (req, res) => {
           introVideo: updatedCourse.introVideo,
           price: updatedCourse.price,
           discountPrice: updatedCourse.discountPrice,
+          discountPercentage: updatedCourse.discountPercentage,
           level: updatedCourse.level,
           status: updatedCourse.status,
           language: updatedCourse.language,
@@ -971,6 +1418,19 @@ const updateCourse = asyncHandler(async (req, res) => {
       },
     });
   } catch (error) {
+    if (req.file && req.file.path) {
+      try {
+        const publicId = req.file.path
+          .split("/")
+          .slice(-2)
+          .join("/")
+          .split(".")[0];
+        await deleteFromCloudinary(publicId, "image");
+      } catch (deleteError) {
+        console.error("Error deleting uploaded thumbnail:", deleteError);
+      }
+    }
+
     console.error(`UPDATE_COURSE_ERROR [${requestId}]:`, {
       error: error.message,
       stack: error.stack,
@@ -995,188 +1455,319 @@ const updateCourse = asyncHandler(async (req, res) => {
 });
 
 const validateCourseForSubmission = async (courseId) => {
-  const course = await prisma.course.findUnique({
-    where: { id: courseId },
-    include: {
-      sections: {
-        include: {
-          lessons: {
-            select: {
-              id: true,
-              title: true,
-              duration: true,
-              type: true,
-              content: true,
-              videoUrl: true,
-            },
+  const cacheKey = `course_submission_validation:${courseId}`;
+
+  try {
+    const cachedResult = await redisService.getJSON(cacheKey);
+    if (cachedResult) {
+      return cachedResult;
+    }
+
+    const [course, sections, lessons, quizzes, questions, assignments] =
+      await Promise.all([
+        prisma.course.findUnique({
+          where: { id: courseId },
+          select: {
+            id: true,
+            title: true,
+            description: true,
+            shortDescription: true,
+            thumbnail: true,
+            previewVideo: true,
+            introVideo: true,
+            learningOutcomes: true,
+            requirements: true,
+            targetAudience: true,
           },
-          quizzes: {
-            include: {
-              questions: {
-                select: {
-                  id: true,
-                  content: true,
-                  type: true,
-                  correctAnswer: true,
-                },
-              },
-            },
+        }),
+        prisma.section.findMany({
+          where: { courseId },
+          select: {
+            id: true,
+            title: true,
+            isPublished: true,
           },
-          assignments: {
-            select: {
-              id: true,
-              title: true,
-              description: true,
-              instructions: true,
-            },
+        }),
+        prisma.lesson.findMany({
+          where: { section: { courseId } },
+          select: {
+            id: true,
+            title: true,
+            duration: true,
+            type: true,
+            content: true,
+            videoUrl: true,
+            sectionId: true,
           },
-        },
-      },
-    },
-  });
+        }),
+        prisma.quiz.findMany({
+          where: { section: { courseId } },
+          select: {
+            id: true,
+            title: true,
+            sectionId: true,
+          },
+        }),
+        prisma.question.findMany({
+          where: { quiz: { section: { courseId } } },
+          select: {
+            id: true,
+            content: true,
+            type: true,
+            correctAnswer: true,
+            quizId: true,
+          },
+        }),
+        prisma.assignment.findMany({
+          where: { section: { courseId } },
+          select: {
+            id: true,
+            title: true,
+            description: true,
+            instructions: true,
+            sectionId: true,
+          },
+        }),
+      ]);
 
-  const validationErrors = [];
-  const warnings = [];
+    if (!course) {
+      return {
+        isValid: false,
+        errors: ["Course not found"],
+        warnings: [],
+        stats: {},
+      };
+    }
 
-  if (!course.title || course.title.length < 10) {
-    validationErrors.push("Course title must be at least 10 characters long");
-  }
+    const validationErrors = [];
+    const warnings = [];
 
-  if (!course.description || course.description.length < 200) {
-    validationErrors.push(
-      "Course description must be at least 200 characters long"
-    );
-  }
+    if (!course.title || course.title.length < 10) {
+      validationErrors.push("Course title must be at least 10 characters long");
+    }
 
-  if (!course.shortDescription || course.shortDescription.length < 50) {
-    validationErrors.push(
-      "Short description must be at least 50 characters long"
-    );
-  }
-
-  if (!course.thumbnail) {
-    validationErrors.push("Course thumbnail is required");
-  }
-
-  if (!course.previewVideo && !course.introVideo) {
-    warnings.push(
-      "Consider adding a preview or intro video to attract more students"
-    );
-  }
-
-  if (!course.learningOutcomes || course.learningOutcomes.length < 3) {
-    validationErrors.push("At least 3 learning outcomes are required");
-  }
-
-  if (!course.requirements || course.requirements.length === 0) {
-    warnings.push("Consider adding course requirements to set expectations");
-  }
-
-  if (!course.targetAudience || course.targetAudience.length === 0) {
-    warnings.push(
-      "Target audience helps students understand if the course is right for them"
-    );
-  }
-
-  if (course.sections.length === 0) {
-    validationErrors.push("Course must have at least one section");
-  }
-
-  const publishedSections = course.sections.filter((s) => s.isPublished);
-  if (publishedSections.length === 0) {
-    validationErrors.push("Course must have at least one published section");
-  }
-
-  let totalDuration = 0;
-  let totalLessons = 0;
-  let hasVideoContent = false;
-
-  publishedSections.forEach((section) => {
-    if (
-      section.lessons.length === 0 &&
-      section.quizzes.length === 0 &&
-      section.assignments.length === 0
-    ) {
+    if (!course.description || course.description.length < 200) {
       validationErrors.push(
-        `Section "${section.title}" must have at least one piece of content`
+        "Course description must be at least 200 characters long"
       );
     }
 
-    section.lessons.forEach((lesson) => {
-      totalLessons++;
-      totalDuration += lesson.duration || 0;
+    if (!course.shortDescription || course.shortDescription.length < 50) {
+      validationErrors.push(
+        "Short description must be at least 50 characters long"
+      );
+    }
 
-      if (lesson.type === "VIDEO" && lesson.videoUrl) {
-        hasVideoContent = true;
-      }
+    if (!course.thumbnail) {
+      validationErrors.push("Course thumbnail is required");
+    }
 
-      if (!lesson.content && !lesson.videoUrl) {
-        validationErrors.push(
-          `Lesson "${lesson.title}" must have content or video`
-        );
+    if (!course.previewVideo && !course.introVideo) {
+      warnings.push(
+        "Consider adding a preview or intro video to attract more students"
+      );
+    }
+
+    if (!course.learningOutcomes || course.learningOutcomes.length < 3) {
+      validationErrors.push("At least 3 learning outcomes are required");
+    }
+
+    if (!course.requirements || course.requirements.length === 0) {
+      warnings.push("Consider adding course requirements to set expectations");
+    }
+
+    if (!course.targetAudience || course.targetAudience.length === 0) {
+      warnings.push(
+        "Target audience helps students understand if the course is right for them"
+      );
+    }
+
+    if (sections.length === 0) {
+      validationErrors.push("Course must have at least one section");
+    }
+
+    const publishedSections = sections.filter((s) => s.isPublished);
+    if (publishedSections.length === 0) {
+      validationErrors.push("Course must have at least one published section");
+    }
+
+    const publishedSectionIds = new Set(publishedSections.map((s) => s.id));
+    const sectionMap = new Map(sections.map((s) => [s.id, s]));
+
+    const publishedLessons = lessons.filter((lesson) =>
+      publishedSectionIds.has(lesson.sectionId)
+    );
+    const publishedQuizzes = quizzes.filter((quiz) =>
+      publishedSectionIds.has(quiz.sectionId)
+    );
+    const publishedAssignments = assignments.filter((assignment) =>
+      publishedSectionIds.has(assignment.sectionId)
+    );
+
+    const quizMap = new Map(publishedQuizzes.map((q) => [q.id, q]));
+    const publishedQuestions = questions.filter((question) =>
+      quizMap.has(question.quizId)
+    );
+
+    let totalDuration = 0;
+    let totalLessons = publishedLessons.length;
+    let hasVideoContent = false;
+
+    const contentBySectionId = new Map();
+    publishedSections.forEach((section) => {
+      contentBySectionId.set(section.id, {
+        lessons: [],
+        quizzes: [],
+        assignments: [],
+      });
+    });
+
+    publishedLessons.forEach((lesson) => {
+      const sectionContent = contentBySectionId.get(lesson.sectionId);
+      if (sectionContent) {
+        sectionContent.lessons.push(lesson);
+        totalDuration += lesson.duration || 0;
+
+        if (lesson.type === "VIDEO" && lesson.videoUrl) {
+          hasVideoContent = true;
+        }
+
+        if (!lesson.content && !lesson.videoUrl) {
+          const section = sectionMap.get(lesson.sectionId);
+          validationErrors.push(
+            `Lesson "${lesson.title}" in section "${section?.title}" must have content or video`
+          );
+        }
       }
     });
 
-    section.quizzes.forEach((quiz) => {
-      if (quiz.questions.length === 0) {
+    publishedQuizzes.forEach((quiz) => {
+      const sectionContent = contentBySectionId.get(quiz.sectionId);
+      if (sectionContent) {
+        sectionContent.quizzes.push({
+          ...quiz,
+          questions: publishedQuestions.filter((q) => q.quizId === quiz.id),
+        });
+      }
+    });
+
+    publishedAssignments.forEach((assignment) => {
+      const sectionContent = contentBySectionId.get(assignment.sectionId);
+      if (sectionContent) {
+        sectionContent.assignments.push(assignment);
+      }
+    });
+
+    contentBySectionId.forEach((content, sectionId) => {
+      const section = sectionMap.get(sectionId);
+      if (!section) return;
+
+      if (
+        content.lessons.length === 0 &&
+        content.quizzes.length === 0 &&
+        content.assignments.length === 0
+      ) {
         validationErrors.push(
-          `Quiz "${quiz.title}" must have at least one question`
+          `Section "${section.title}" must have at least one piece of content`
         );
       }
 
-      quiz.questions.forEach((question) => {
-        if (!question.content) {
+      content.quizzes.forEach((quiz) => {
+        if (quiz.questions.length === 0) {
           validationErrors.push(
-            `Quiz question in "${quiz.title}" is missing content`
+            `Quiz "${quiz.title}" must have at least one question`
           );
         }
 
-        if (question.type !== "ESSAY" && !question.correctAnswer) {
+        quiz.questions.forEach((question) => {
+          if (!question.content) {
+            validationErrors.push(
+              `Quiz question in "${quiz.title}" is missing content`
+            );
+          }
+
+          if (question.type !== "ESSAY" && !question.correctAnswer) {
+            validationErrors.push(
+              `Quiz question in "${quiz.title}" is missing correct answer`
+            );
+          }
+        });
+      });
+
+      content.assignments.forEach((assignment) => {
+        if (!assignment.instructions || assignment.instructions.length < 50) {
           validationErrors.push(
-            `Quiz question in "${quiz.title}" is missing correct answer`
+            `Assignment "${assignment.title}" needs detailed instructions`
           );
         }
       });
     });
 
-    section.assignments.forEach((assignment) => {
-      if (!assignment.instructions || assignment.instructions.length < 50) {
-        validationErrors.push(
-          `Assignment "${assignment.title}" needs detailed instructions`
-        );
+    if (totalDuration < 1800) {
+      warnings.push(
+        "Course duration is less than 30 minutes. Consider adding more content"
+      );
+    }
+
+    if (totalLessons < 5) {
+      warnings.push(
+        "Course has fewer than 5 lessons. Consider breaking content into smaller lessons"
+      );
+    }
+
+    if (!hasVideoContent) {
+      warnings.push(
+        "Course has no video content. Video lessons typically engage students better"
+      );
+    }
+
+    const result = {
+      isValid: validationErrors.length === 0,
+      errors: validationErrors,
+      warnings: warnings,
+      stats: {
+        totalDuration,
+        totalLessons,
+        totalSections: publishedSections.length,
+        hasVideoContent,
+      },
+    };
+
+    setImmediate(async () => {
+      try {
+        await redisService.setJSON(cacheKey, result, { ex: 900 });
+      } catch (cacheError) {
+        console.warn("Failed to cache validation result:", cacheError);
       }
     });
-  });
 
-  if (totalDuration < 1800) {
-    warnings.push(
-      "Course duration is less than 30 minutes. Consider adding more content"
-    );
+    return result;
+  } catch (error) {
+    console.error("Validation error:", error);
+    return {
+      isValid: false,
+      errors: ["Validation failed due to system error"],
+      warnings: [],
+      stats: {},
+    };
   }
+};
 
-  if (totalLessons < 5) {
-    warnings.push(
-      "Course has fewer than 5 lessons. Consider breaking content into smaller lessons"
+const invalidateSubmissionValidationCache = async (courseId) => {
+  try {
+    const patterns = [
+      `course_submission_validation:${courseId}`,
+      `course_content_validation:${courseId}`,
+      `course_validation:${courseId}`,
+      `course:${courseId}:*`,
+    ];
+
+    await Promise.all(
+      patterns.map((pattern) => redisService.delPattern(pattern))
     );
+  } catch (error) {
+    console.warn("Cache invalidation failed:", error);
   }
-
-  if (!hasVideoContent) {
-    warnings.push(
-      "Course has no video content. Video lessons typically engage students better"
-    );
-  }
-
-  return {
-    isValid: validationErrors.length === 0,
-    errors: validationErrors,
-    warnings: warnings,
-    stats: {
-      totalDuration,
-      totalLessons,
-      totalSections: publishedSections.length,
-      hasVideoContent,
-    },
-  };
 };
 
 const submitForReview = asyncHandler(async (req, res) => {
@@ -1185,7 +1776,6 @@ const submitForReview = asyncHandler(async (req, res) => {
 
   try {
     const { courseId } = req.params;
-    const { submitMessage } = req.body;
 
     if (!courseId) {
       return res.status(400).json({
@@ -1195,33 +1785,46 @@ const submitForReview = asyncHandler(async (req, res) => {
       });
     }
 
-    const instructor = await prisma.instructor.findUnique({
-      where: { userId: req.userAuthId },
-      include: {
-        user: {
-          select: {
-            firstName: true,
-            lastName: true,
-            email: true,
+    const [instructor, course] = await Promise.all([
+      prisma.instructor.findUnique({
+        where: { userId: req.userAuthId },
+        select: {
+          id: true,
+          user: {
+            select: {
+              firstName: true,
+              lastName: true,
+              email: true,
+            },
           },
         },
-      },
-    });
+      }),
+      prisma.course.findUnique({
+        where: { id: courseId },
+        select: {
+          id: true,
+          title: true,
+          status: true,
+          slug: true,
+          instructorId: true,
+          category: {
+            select: {
+              name: true,
+            },
+          },
+        },
+      }),
+    ]);
 
-    const course = await prisma.course.findFirst({
-      where: {
-        id: courseId,
-        instructorId: instructor.id,
-      },
-      select: {
-        id: true,
-        title: true,
-        status: true,
-        slug: true,
-      },
-    });
+    if (!instructor) {
+      return res.status(404).json({
+        success: false,
+        message: "Instructor profile not found",
+        code: "INSTRUCTOR_NOT_FOUND",
+      });
+    }
 
-    if (!course) {
+    if (!course || course.instructorId !== instructor.id) {
       return res.status(404).json({
         success: false,
         message: "Course not found or you don't have permission to submit it",
@@ -1258,49 +1861,52 @@ const submitForReview = asyncHandler(async (req, res) => {
         totalLessons: validation.stats.totalLessons,
         lastUpdated: new Date(),
       },
-      include: {
-        category: {
-          select: {
-            name: true,
-          },
-        },
+      select: {
+        id: true,
+        title: true,
+        slug: true,
+        status: true,
+        reviewSubmittedAt: true,
+        duration: true,
+        totalLessons: true,
       },
     });
 
-    try {
-      await emailService.sendCourseSubmittedForReview({
-        email: instructor.user.email,
-        firstName: instructor.user.firstName,
-        courseTitle: course.title,
-        submissionDate: new Date(),
-      });
-    } catch (emailError) {
-      console.error("Failed to send submission email:", emailError);
-    }
-
-    try {
-      await notificationService.createNotification({
-        userId: req.userAuthId,
-        type: "COURSE_PUBLISHED",
-        title: "Course Submitted for Review",
-        message: `Your course "${course.title}" has been submitted for review. Our team will evaluate it within 3-5 business days.`,
-        priority: "NORMAL",
-        data: {
-          courseId: course.id,
-          courseTitle: course.title,
-          submissionDate: new Date(),
-          reviewTimeline: "3-5 business days",
-        },
-        actionUrl: `/instructor/courses/${course.id}`,
-        sendEmail: false,
-        sendSocket: true,
-      });
-    } catch (notificationError) {
-      console.error("Failed to create notification:", notificationError);
-    }
-
-    await redisService.delPattern(`course:${courseId}*`);
-    await redisService.delPattern(`instructor_courses:${req.userAuthId}*`);
+    setImmediate(async () => {
+      try {
+        await Promise.all([
+          emailService.sendCourseSubmittedForReview({
+            email: instructor.user.email,
+            firstName: instructor.user.firstName,
+            courseTitle: course.title,
+            submissionDate: new Date(),
+          }),
+          notificationService.createNotification({
+            userId: req.userAuthId,
+            type: "COURSE_PUBLISHED",
+            title: "Course Submitted for Review",
+            message: `Your course "${course.title}" has been submitted for review. Our team will evaluate it within 3-5 business days.`,
+            priority: "NORMAL",
+            data: {
+              courseId: course.id,
+              courseTitle: course.title,
+              submissionDate: new Date(),
+              reviewTimeline: "3-5 business days",
+            },
+            actionUrl: `/instructor/courses/${course.id}`,
+            sendEmail: false,
+            sendSocket: true,
+          }),
+          Promise.all([
+            redisService.delPattern(`course:${courseId}*`),
+            redisService.delPattern(`instructor_courses:${req.userAuthId}*`),
+            redisService.delPattern(`courses:${req.userAuthId}*`),
+          ]),
+        ]);
+      } catch (error) {
+        console.error("Background operations failed:", error);
+      }
+    });
 
     const executionTime = performance.now() - startTime;
 
@@ -1316,7 +1922,7 @@ const submitForReview = asyncHandler(async (req, res) => {
           reviewSubmittedAt: updatedCourse.reviewSubmittedAt,
           duration: updatedCourse.duration,
           totalLessons: updatedCourse.totalLessons,
-          category: updatedCourse.category.name,
+          category: course.category.name,
         },
         validation: {
           warnings: validation.warnings,
@@ -1373,24 +1979,43 @@ const validateCourse = asyncHandler(async (req, res) => {
       });
     }
 
-    const instructor = await prisma.instructor.findUnique({
-      where: { userId: req.userAuthId },
-      select: { id: true },
-    });
+    const cacheKey = `course_validation:${courseId}`;
+    const cachedValidation = await redisService.getJSON(cacheKey);
 
-    const course = await prisma.course.findFirst({
-      where: {
-        id: courseId,
-        instructorId: instructor.id,
-      },
-      select: {
-        id: true,
-        title: true,
-        status: true,
-      },
-    });
+    if (cachedValidation) {
+      const executionTime = performance.now() - startTime;
+      return res.status(200).json({
+        success: true,
+        message: "Course validation completed",
+        data: {
+          ...cachedValidation,
+          cached: true,
+        },
+        meta: {
+          requestId,
+          executionTime: Math.round(executionTime),
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
 
-    if (!course) {
+    const [instructor, course] = await Promise.all([
+      prisma.instructor.findUnique({
+        where: { userId: req.userAuthId },
+        select: { id: true },
+      }),
+      prisma.course.findUnique({
+        where: { id: courseId },
+        select: {
+          id: true,
+          title: true,
+          status: true,
+          instructorId: true,
+        },
+      }),
+    ]);
+
+    if (!instructor || !course || course.instructorId !== instructor.id) {
       return res.status(404).json({
         success: false,
         message: "Course not found or you don't have permission to validate it",
@@ -1400,25 +2025,35 @@ const validateCourse = asyncHandler(async (req, res) => {
 
     const validation = await validateCourseForSubmission(courseId);
 
+    const responseData = {
+      courseId: course.id,
+      courseTitle: course.title,
+      courseStatus: course.status,
+      validation: {
+        isValid: validation.isValid,
+        errors: validation.errors,
+        warnings: validation.warnings,
+        stats: validation.stats,
+      },
+      readyForSubmission:
+        validation.isValid &&
+        (course.status === "DRAFT" || course.status === "REJECTED"),
+    };
+
+    setImmediate(async () => {
+      try {
+        await redisService.setJSON(cacheKey, responseData, { ex: 300 });
+      } catch (cacheError) {
+        console.warn("Failed to cache validation result:", cacheError);
+      }
+    });
+
     const executionTime = performance.now() - startTime;
 
     res.status(200).json({
       success: true,
       message: "Course validation completed",
-      data: {
-        courseId: course.id,
-        courseTitle: course.title,
-        courseStatus: course.status,
-        validation: {
-          isValid: validation.isValid,
-          errors: validation.errors,
-          warnings: validation.warnings,
-          stats: validation.stats,
-        },
-        readyForSubmission:
-          validation.isValid &&
-          (course.status === "DRAFT" || course.status === "REJECTED"),
-      },
+      data: responseData,
       meta: {
         requestId,
         executionTime: Math.round(executionTime),
@@ -1640,158 +2275,6 @@ const publishCourse = asyncHandler(async (req, res) => {
   }
 });
 
-const archiveCourse = asyncHandler(async (req, res) => {
-  const requestId = generateRequestId();
-  const startTime = performance.now();
-
-  try {
-    const { courseId } = req.params;
-    const { reason } = req.body;
-
-    if (!courseId) {
-      return res.status(400).json({
-        success: false,
-        message: "Course ID is required",
-        code: "MISSING_COURSE_ID",
-      });
-    }
-
-    const instructor = await prisma.instructor.findUnique({
-      where: { userId: req.userAuthId },
-      include: {
-        user: {
-          select: {
-            firstName: true,
-            lastName: true,
-            email: true,
-          },
-        },
-      },
-    });
-
-    const course = await prisma.course.findFirst({
-      where: {
-        id: courseId,
-        instructorId: instructor.id,
-      },
-      select: {
-        id: true,
-        title: true,
-        status: true,
-        totalEnrollments: true,
-      },
-    });
-
-    if (!course) {
-      return res.status(404).json({
-        success: false,
-        message: "Course not found or you don't have permission to archive it",
-        code: "COURSE_NOT_FOUND",
-      });
-    }
-
-    if (course.status === "ARCHIVED") {
-      return res.status(400).json({
-        success: false,
-        message: "Course is already archived",
-        code: "ALREADY_ARCHIVED",
-      });
-    }
-
-    if (course.status !== "PUBLISHED") {
-      return res.status(400).json({
-        success: false,
-        message: "Only published courses can be archived",
-        code: "INVALID_STATUS",
-      });
-    }
-
-    const archivedCourse = await prisma.course.update({
-      where: { id: courseId },
-      data: {
-        status: "ARCHIVED",
-        archivedAt: new Date(),
-        lastUpdated: new Date(),
-      },
-    });
-
-    if (course.totalEnrollments > 0) {
-      try {
-        await notificationService.createNotification({
-          userId: req.userAuthId,
-          type: "COURSE_UPDATED",
-          title: "Course Archived",
-          message: `Your course "${course.title}" has been archived. ${course.totalEnrollments} enrolled students will retain access to course materials.`,
-          priority: "NORMAL",
-          data: {
-            courseId: course.id,
-            courseTitle: course.title,
-            archivedAt: new Date(),
-            reason: reason || "Course archived by instructor",
-            enrolledStudents: course.totalEnrollments,
-          },
-          actionUrl: `/instructor/courses/${course.id}`,
-          sendEmail: false,
-          sendSocket: true,
-        });
-      } catch (notificationError) {
-        console.error("Failed to create notification:", notificationError);
-      }
-    }
-
-    await redisService.delPattern(`course:${courseId}*`);
-    await redisService.delPattern(`instructor_courses:${req.userAuthId}*`);
-    await redisService.delPattern(`courses:*`);
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(200).json({
-      success: true,
-      message: "Course archived successfully",
-      data: {
-        course: {
-          id: archivedCourse.id,
-          title: archivedCourse.title,
-          status: archivedCourse.status,
-          archivedAt: archivedCourse.archivedAt,
-          enrolledStudents: course.totalEnrollments,
-        },
-        impact: {
-          enrolledStudents: course.totalEnrollments,
-          studentAccess:
-            "Enrolled students will retain access to course materials",
-          visibility: "Course is no longer visible to new students",
-        },
-      },
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error(`ARCHIVE_COURSE_ERROR [${requestId}]:`, {
-      error: error.message,
-      stack: error.stack,
-      userId: req.userAuthId,
-      courseId: req.params.courseId,
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to archive course. Please try again.",
-      code: "INTERNAL_SERVER_ERROR",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
 const deleteCourse = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();
   const startTime = performance.now();
@@ -1800,51 +2283,47 @@ const deleteCourse = asyncHandler(async (req, res) => {
     const { courseId } = req.params;
     const { confirmDelete } = req.body;
 
-    if (!courseId) {
+    if (!courseId || !confirmDelete) {
       return res.status(400).json({
         success: false,
-        message: "Course ID is required",
-        code: "MISSING_COURSE_ID",
+        message: !courseId
+          ? "Course ID is required"
+          : "Please confirm course deletion",
+        code: !courseId ? "MISSING_COURSE_ID" : "CONFIRMATION_REQUIRED",
       });
     }
 
-    if (!confirmDelete) {
-      return res.status(400).json({
-        success: false,
-        message: "Please confirm course deletion",
-        code: "CONFIRMATION_REQUIRED",
-      });
-    }
-
-    const instructor = await prisma.instructor.findUnique({
-      where: { userId: req.userAuthId },
-      select: { id: true, totalCourses: true },
-    });
-
-    const course = await prisma.course.findFirst({
-      where: {
-        id: courseId,
-        instructorId: instructor.id,
-      },
-      include: {
-        enrollments: {
-          select: { id: true },
-        },
-        _count: {
-          select: {
-            enrollments: true,
-            reviews: true,
-            sections: true,
+    const [instructor, course] = await Promise.all([
+      prisma.instructor.findUnique({
+        where: { userId: req.userAuthId },
+        select: { id: true, totalCourses: true },
+      }),
+      prisma.course.findFirst({
+        where: { id: courseId },
+        select: {
+          id: true,
+          title: true,
+          status: true,
+          thumbnail: true,
+          instructorId: true,
+          _count: {
+            select: {
+              enrollments: true,
+              reviews: true,
+              sections: true,
+            },
           },
         },
-      },
-    });
+      }),
+    ]);
 
-    if (!course) {
+    if (!instructor || !course || course.instructorId !== instructor.id) {
       return res.status(404).json({
         success: false,
-        message: "Course not found or you don't have permission to delete it",
-        code: "COURSE_NOT_FOUND",
+        message: !instructor
+          ? "Instructor profile not found"
+          : "Course not found or you don't have permission to delete it",
+        code: !instructor ? "INSTRUCTOR_NOT_FOUND" : "COURSE_NOT_FOUND",
       });
     }
 
@@ -1871,238 +2350,53 @@ const deleteCourse = asyncHandler(async (req, res) => {
       });
     }
 
+    const deletedAt = new Date();
+
     await prisma.$transaction(async (tx) => {
-      await tx.answer.deleteMany({
-        where: {
-          attempt: {
-            quiz: {
-              section: {
-                courseId: courseId,
-              },
-            },
-          },
-        },
-      });
-
-      await tx.quizAttempt.deleteMany({
-        where: {
-          quiz: {
-            section: {
-              courseId: courseId,
-            },
-          },
-        },
-      });
-
-      await tx.assignmentSubmission.deleteMany({
-        where: {
-          assignment: {
-            section: {
-              courseId: courseId,
-            },
-          },
-        },
-      });
-
-      await tx.lessonCompletion.deleteMany({
-        where: {
-          lesson: {
-            section: {
-              courseId: courseId,
-            },
-          },
-        },
-      });
-
-      await tx.contentCompletion.deleteMany({
-        where: {
-          contentItem: {
-            section: {
-              courseId: courseId,
-            },
-          },
-        },
-      });
-
-      await tx.question.deleteMany({
-        where: {
-          quiz: {
-            section: {
-              courseId: courseId,
-            },
-          },
-        },
-      });
-
-      await tx.attachment.deleteMany({
-        where: {
-          lesson: {
-            section: {
-              courseId: courseId,
-            },
-          },
-        },
-      });
-
-      await tx.assignment.deleteMany({
-        where: {
-          section: {
-            courseId: courseId,
-          },
-        },
-      });
-
-      await tx.quiz.deleteMany({
-        where: {
-          section: {
-            courseId: courseId,
-          },
-        },
-      });
-
-      await tx.lesson.deleteMany({
-        where: {
-          section: {
-            courseId: courseId,
-          },
-        },
-      });
-
-      await tx.contentItem.deleteMany({
-        where: {
-          section: {
-            courseId: courseId,
-          },
-        },
-      });
-
-      await tx.section.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.qnAAnswer.deleteMany({
-        where: {
-          question: {
-            courseId: courseId,
-          },
-        },
-      });
-
-      await tx.qnAQuestion.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.note.deleteMany({
-        where: {
-          lesson: {
-            section: {
-              courseId: courseId,
-            },
-          },
-        },
-      });
-
-      await tx.bookmark.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.certificate.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.courseProgress.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.reviewReply.deleteMany({
-        where: {
-          review: {
-            courseId: courseId,
-          },
-        },
-      });
-
-      await tx.review.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.cartItem.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.wishlistItem.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.fAQ.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.courseSettings.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.enrollment.deleteMany({
-        where: {
-          courseId: courseId,
-        },
-      });
-
-      await tx.course.delete({
-        where: {
-          id: courseId,
+      await tx.course.update({
+        where: { id: courseId },
+        data: {
+          status: "ARCHIVED",
+          archivedAt: deletedAt,
+          title: `${course.title} [DELETED-${Date.now()}]`,
         },
       });
 
       await tx.instructor.update({
         where: { id: instructor.id },
-        data: {
-          totalCourses: Math.max(0, instructor.totalCourses - 1),
-        },
+        data: { totalCourses: Math.max(0, instructor.totalCourses - 1) },
       });
     });
 
-    await redisService.delPattern(`course:${courseId}*`);
-    await redisService.delPattern(`instructor_courses:${req.userAuthId}*`);
-    await redisService.delPattern(`courses:*`);
+    setImmediate(async () => {
+      try {
+        await deleteCourseBackground(courseId, course.thumbnail);
+      } catch (error) {
+        console.error(
+          `Background deletion failed for course ${courseId}:`,
+          error
+        );
+      }
+    });
 
     const executionTime = performance.now() - startTime;
 
     res.status(200).json({
       success: true,
-      message: "Course deleted successfully",
+      message: "Course deletion initiated successfully",
       data: {
         deletedCourse: {
           id: course.id,
           title: course.title,
-          status: course.status,
-          deletedAt: new Date(),
+          status: "DELETED",
+          deletedAt,
         },
         impact: {
           sectionsDeleted: course._count.sections,
           enrollmentsAffected: course._count.enrollments,
           reviewsDeleted: course._count.reviews,
         },
+        note: "Course data is being cleaned up in the background",
       },
       meta: {
         requestId,
@@ -2133,337 +2427,93 @@ const deleteCourse = asyncHandler(async (req, res) => {
   }
 });
 
-const duplicateCourse = asyncHandler(async (req, res) => {
-  const requestId = generateRequestId();
-  const startTime = performance.now();
-
+const deleteCourseBackground = async (courseId, thumbnail) => {
   try {
-    const { courseId } = req.params;
-    const { newTitle, newSlug } = req.body;
+    console.log(`Starting background deletion for course: ${courseId}`);
 
-    if (!courseId) {
-      return res.status(400).json({
-        success: false,
-        message: "Course ID is required",
-        code: "MISSING_COURSE_ID",
-      });
+    const deleteOperations = [
+      () =>
+        prisma.answer.deleteMany({
+          where: { attempt: { quiz: { section: { courseId } } } },
+        }),
+      () =>
+        prisma.quizAttempt.deleteMany({
+          where: { quiz: { section: { courseId } } },
+        }),
+      () =>
+        prisma.assignmentSubmission.deleteMany({
+          where: { assignment: { section: { courseId } } },
+        }),
+      () =>
+        prisma.lessonCompletion.deleteMany({
+          where: { lesson: { section: { courseId } } },
+        }),
+      () =>
+        prisma.contentCompletion.deleteMany({
+          where: { contentItem: { section: { courseId } } },
+        }),
+      () =>
+        prisma.note.deleteMany({
+          where: { lesson: { section: { courseId } } },
+        }),
+      () =>
+        prisma.attachment.deleteMany({
+          where: { lesson: { section: { courseId } } },
+        }),
+      () =>
+        prisma.question.deleteMany({
+          where: { quiz: { section: { courseId } } },
+        }),
+      () => prisma.assignment.deleteMany({ where: { section: { courseId } } }),
+      () => prisma.quiz.deleteMany({ where: { section: { courseId } } }),
+      () => prisma.lesson.deleteMany({ where: { section: { courseId } } }),
+      () => prisma.contentItem.deleteMany({ where: { section: { courseId } } }),
+      () => prisma.section.deleteMany({ where: { courseId } }),
+      () => prisma.qnAAnswer.deleteMany({ where: { question: { courseId } } }),
+      () => prisma.qnAQuestion.deleteMany({ where: { courseId } }),
+      () => prisma.reviewReply.deleteMany({ where: { review: { courseId } } }),
+      () => prisma.review.deleteMany({ where: { courseId } }),
+      () => prisma.bookmark.deleteMany({ where: { courseId } }),
+      () => prisma.certificate.deleteMany({ where: { courseId } }),
+      () => prisma.courseProgress.deleteMany({ where: { courseId } }),
+      () => prisma.cartItem.deleteMany({ where: { courseId } }),
+      () => prisma.wishlistItem.deleteMany({ where: { courseId } }),
+      () => prisma.fAQ.deleteMany({ where: { courseId } }),
+      () => prisma.courseSettings.deleteMany({ where: { courseId } }),
+      () => prisma.enrollment.deleteMany({ where: { courseId } }),
+    ];
+
+    for (const operation of deleteOperations) {
+      try {
+        await operation();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } catch (error) {
+        console.error(`Delete operation failed:`, error);
+      }
     }
 
-    const instructor = await prisma.instructor.findUnique({
-      where: { userId: req.userAuthId },
-      select: { id: true, totalCourses: true },
-    });
+    await prisma.course.delete({ where: { id: courseId } });
 
-    const originalCourse = await prisma.course.findFirst({
-      where: {
-        id: courseId,
-        instructorId: instructor.id,
-      },
-      include: {
-        sections: {
-          include: {
-            lessons: {
-              include: {
-                attachments: true,
-              },
-            },
-            quizzes: {
-              include: {
-                questions: true,
-              },
-            },
-            assignments: true,
-            contentItems: true,
-          },
-        },
-        courseSettings: true,
-        faqs: true,
-      },
-    });
-
-    if (!originalCourse) {
-      return res.status(404).json({
-        success: false,
-        message:
-          "Course not found or you don't have permission to duplicate it",
-        code: "COURSE_NOT_FOUND",
-      });
+    if (thumbnail) {
+      try {
+        const publicId = thumbnail.split("/").slice(-2).join("/").split(".")[0];
+        await deleteFromCloudinary(publicId, "image");
+      } catch (cloudinaryError) {
+        console.error("Cloudinary cleanup failed:", cloudinaryError);
+      }
     }
 
-    let duplicateTitle = newTitle || `${originalCourse.title} (Copy)`;
-    let duplicateSlug = newSlug || generateCourseSlug(duplicateTitle);
+    await Promise.allSettled([
+      redisService.delPattern(`course:${courseId}*`),
+      redisService.delPattern(`instructor_courses:*`),
+      redisService.delPattern(`courses:*`),
+    ]);
 
-    let counter = 1;
-    let baseSlug = duplicateSlug;
-    while (await prisma.course.findUnique({ where: { slug: duplicateSlug } })) {
-      duplicateSlug = `${baseSlug}-${counter}`;
-      counter++;
-    }
-
-    const duplicatedCourse = await prisma.$transaction(async (tx) => {
-      const newCourse = await tx.course.create({
-        data: {
-          title: duplicateTitle,
-          slug: duplicateSlug,
-          description: originalCourse.description,
-          shortDescription: originalCourse.shortDescription,
-          thumbnail: originalCourse.thumbnail,
-          previewVideo: originalCourse.previewVideo,
-          introVideo: originalCourse.introVideo,
-          price: originalCourse.price,
-          discountPrice: originalCourse.discountPrice,
-          originalPrice: originalCourse.originalPrice,
-          level: originalCourse.level,
-          language: originalCourse.language,
-          subtitles: originalCourse.subtitles,
-          requirements: originalCourse.requirements,
-          learningOutcomes: originalCourse.learningOutcomes,
-          targetAudience: originalCourse.targetAudience,
-          tags: originalCourse.tags,
-          keyPoints: originalCourse.keyPoints,
-          duration: 0,
-          status: "DRAFT",
-          instructorId: instructor.id,
-          categoryId: originalCourse.categoryId,
-          subcategoryId: originalCourse.subcategoryId,
-        },
-      });
-
-      if (originalCourse.courseSettings) {
-        await tx.courseSettings.create({
-          data: {
-            courseId: newCourse.id,
-            allowDiscussions: originalCourse.courseSettings.allowDiscussions,
-            allowReviews: originalCourse.courseSettings.allowReviews,
-            requireApproval: originalCourse.courseSettings.requireApproval,
-            certificateEnabled:
-              originalCourse.courseSettings.certificateEnabled,
-            downloadable: originalCourse.courseSettings.downloadable,
-            allowPreview: originalCourse.courseSettings.allowPreview,
-            autoEnrollmentEmail:
-              originalCourse.courseSettings.autoEnrollmentEmail,
-            sequentialProgress:
-              originalCourse.courseSettings.sequentialProgress,
-            passingGrade: originalCourse.courseSettings.passingGrade,
-            certificateTemplate:
-              originalCourse.courseSettings.certificateTemplate,
-            drip: originalCourse.courseSettings.drip,
-            dripSchedule: originalCourse.courseSettings.dripSchedule,
-          },
-        });
-      }
-
-      for (const faq of originalCourse.faqs) {
-        await tx.fAQ.create({
-          data: {
-            courseId: newCourse.id,
-            question: faq.question,
-            answer: faq.answer,
-            order: faq.order,
-            isActive: faq.isActive,
-          },
-        });
-      }
-
-      for (const section of originalCourse.sections) {
-        const newSection = await tx.section.create({
-          data: {
-            courseId: newCourse.id,
-            title: section.title,
-            description: section.description,
-            order: section.order,
-            isPublished: false,
-            isRequired: section.isRequired,
-            isFree: section.isFree,
-            estimatedTime: section.estimatedTime,
-          },
-        });
-
-        for (const contentItem of section.contentItems) {
-          await tx.contentItem.create({
-            data: {
-              sectionId: newSection.id,
-              title: contentItem.title,
-              description: contentItem.description,
-              order: contentItem.order,
-              itemType: contentItem.itemType,
-              isRequired: contentItem.isRequired,
-              isFree: contentItem.isFree,
-              isLocked: contentItem.isLocked,
-              duration: contentItem.duration,
-            },
-          });
-        }
-
-        for (const lesson of section.lessons) {
-          const newLesson = await tx.lesson.create({
-            data: {
-              sectionId: newSection.id,
-              title: lesson.title,
-              description: lesson.description,
-              order: lesson.order,
-              duration: lesson.duration,
-              isFree: lesson.isFree,
-              isPreview: lesson.isPreview,
-              type: lesson.type,
-              content: lesson.content,
-              videoUrl: lesson.videoUrl,
-              videoQuality: lesson.videoQuality,
-              captions: lesson.captions,
-              transcript: lesson.transcript,
-              resources: lesson.resources,
-            },
-          });
-
-          for (const attachment of lesson.attachments) {
-            await tx.attachment.create({
-              data: {
-                lessonId: newLesson.id,
-                name: attachment.name,
-                fileUrl: attachment.fileUrl,
-                fileSize: attachment.fileSize,
-                fileType: attachment.fileType,
-                isDownloadable: attachment.isDownloadable,
-              },
-            });
-          }
-        }
-
-        for (const quiz of section.quizzes) {
-          const newQuiz = await tx.quiz.create({
-            data: {
-              sectionId: newSection.id,
-              title: quiz.title,
-              description: quiz.description,
-              instructions: quiz.instructions,
-              duration: quiz.duration,
-              passingScore: quiz.passingScore,
-              maxAttempts: quiz.maxAttempts,
-              order: quiz.order,
-              isRequired: quiz.isRequired,
-              isRandomized: quiz.isRandomized,
-              showResults: quiz.showResults,
-              allowReview: quiz.allowReview,
-            },
-          });
-
-          for (const question of quiz.questions) {
-            await tx.question.create({
-              data: {
-                quizId: newQuiz.id,
-                content: question.content,
-                type: question.type,
-                points: question.points,
-                order: question.order,
-                options: question.options,
-                correctAnswer: question.correctAnswer,
-                explanation: question.explanation,
-                hints: question.hints,
-                difficulty: question.difficulty,
-                tags: question.tags,
-              },
-            });
-          }
-        }
-
-        for (const assignment of section.assignments) {
-          await tx.assignment.create({
-            data: {
-              sectionId: newSection.id,
-              title: assignment.title,
-              description: assignment.description,
-              totalPoints: assignment.totalPoints,
-              order: assignment.order,
-              instructions: assignment.instructions,
-              resources: assignment.resources,
-              rubric: assignment.rubric,
-              allowLateSubmission: assignment.allowLateSubmission,
-              latePenalty: assignment.latePenalty,
-              dueDate: assignment.dueDate,
-            },
-          });
-        }
-      }
-
-      await tx.instructor.update({
-        where: { id: instructor.id },
-        data: { totalCourses: instructor.totalCourses + 1 },
-      });
-
-      return newCourse;
-    });
-
-    await redisService.delPattern(`instructor_courses:${req.userAuthId}*`);
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(201).json({
-      success: true,
-      message: "Course duplicated successfully",
-      data: {
-        originalCourse: {
-          id: originalCourse.id,
-          title: originalCourse.title,
-          slug: originalCourse.slug,
-        },
-        duplicatedCourse: {
-          id: duplicatedCourse.id,
-          title: duplicatedCourse.title,
-          slug: duplicatedCourse.slug,
-          status: duplicatedCourse.status,
-          createdAt: duplicatedCourse.createdAt,
-        },
-        duplicationStats: {
-          sectionsCount: originalCourse.sections.length,
-          lessonsCount: originalCourse.sections.reduce(
-            (sum, s) => sum + s.lessons.length,
-            0
-          ),
-          quizzesCount: originalCourse.sections.reduce(
-            (sum, s) => sum + s.quizzes.length,
-            0
-          ),
-          assignmentsCount: originalCourse.sections.reduce(
-            (sum, s) => sum + s.assignments.length,
-            0
-          ),
-          faqsCount: originalCourse.faqs.length,
-        },
-        nextSteps: [
-          "Review and update the duplicated course content",
-          "Modify sections, lessons, and assessments as needed",
-          "Update course information and pricing",
-          "Submit for review when ready to publish",
-        ],
-      },
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
+    console.log(`Background deletion completed for course: ${courseId}`);
   } catch (error) {
-    console.error(`DUPLICATE_COURSE_ERROR [${requestId}]:`, {
-      error: error.message,
-      stack: error.stack,
-      userId: req.userAuthId,
-      courseId: req.params.courseId,
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to duplicate course. Please try again.",
-      code: "INTERNAL_SERVER_ERROR",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
+    console.error(`Background deletion failed for course ${courseId}:`, error);
   }
-});
+};
 
 const getCourseStats = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();
@@ -2922,9 +2972,7 @@ export {
   submitForReview,
   validateCourse,
   publishCourse,
-  archiveCourse,
   deleteCourse,
-  duplicateCourse,
   getCourseStats,
   getInstructorDashboard,
 };

@@ -1,7 +1,6 @@
 import { config } from "dotenv";
 config();
 
-import crypto from "crypto";
 import { PrismaClient } from "@prisma/client";
 import generateToken from "../../utils/generateToken.js";
 import asyncHandler from "express-async-handler";
@@ -19,7 +18,6 @@ import {
   handleFileCleanup,
   generateRequestId,
   createSessionData,
-  cacheUserData,
   sendWelcomeNotifications,
   generateVerificationToken,
   storeVerificationToken,
@@ -84,11 +82,10 @@ export const registerUser = asyncHandler(async (req, res) => {
 
       const normalizedEmail = email.toLowerCase().trim();
 
-      const rateLimitResult = await redisService.rateLimitCheck(
-        `register:${req.ip}`,
-        5,
-        3600
-      );
+      const [rateLimitResult, existingUser] = await Promise.all([
+        redisService.rateLimitCheck(`register:${req.ip}`, 5, 3600),
+        redisService.getJSON(`user:${normalizedEmail}`),
+      ]);
 
       if (!rateLimitResult.allowed) {
         await handleFileCleanup(profileImageFilename);
@@ -100,11 +97,10 @@ export const registerUser = asyncHandler(async (req, res) => {
         });
       }
 
-      const existingUserCacheKey = `user:${normalizedEmail}`;
-      let existingUser = await redisService.getJSON(existingUserCacheKey);
+      let userExists = existingUser;
 
-      if (!existingUser) {
-        existingUser = await prisma.user.findUnique({
+      if (!userExists) {
+        userExists = await prisma.user.findUnique({
           where: { email: normalizedEmail },
           select: {
             id: true,
@@ -117,17 +113,17 @@ export const registerUser = asyncHandler(async (req, res) => {
           },
         });
 
-        if (existingUser) {
-          await redisService.setJSON(existingUserCacheKey, existingUser, {
+        if (userExists) {
+          await redisService.setJSON(`user:${normalizedEmail}`, userExists, {
             ex: 900,
           });
         }
       }
 
-      if (existingUser) {
+      if (userExists) {
         await handleFileCleanup(profileImageFilename);
 
-        if (existingUser.isVerified) {
+        if (userExists.isVerified) {
           return res.status(409).json({
             success: false,
             message:
@@ -156,22 +152,21 @@ export const registerUser = asyncHandler(async (req, res) => {
         await Promise.all([
           otpService.storeOTP(normalizedEmail, newOtp, 10),
           storeVerificationToken(newVerificationToken, normalizedEmail, 30),
+          emailService.sendOTPVerification({
+            email: normalizedEmail,
+            firstName: userExists.firstName,
+            otp: newOtp,
+            expiresIn: 10,
+            isRegistration: true,
+            actionUrl: `${process.env.FRONTEND_URL}/verify-email?token=${newVerificationToken}`,
+          }),
         ]);
-
-        await emailService.sendOTPVerification({
-          email: normalizedEmail,
-          firstName: existingUser.firstName,
-          otp: newOtp,
-          expiresIn: 10,
-          isRegistration: true,
-          actionUrl: `${process.env.FRONTEND_URL}/verify-email?token=${newVerificationToken}`,
-        });
 
         return res.status(200).json({
           success: true,
           message:
             "Account exists but not verified. New verification code sent to your email.",
-          userId: existingUser.id,
+          userId: userExists.id,
           needsVerification: true,
           code: "ACCOUNT_EXISTS_UNVERIFIED",
         });
@@ -209,15 +204,8 @@ export const registerUser = asyncHandler(async (req, res) => {
         });
 
         await createUserProfile(newUser.id, role, tx);
-
         return newUser;
       });
-
-      await Promise.all([
-        cacheUserData(result),
-        clearUserCaches(normalizedEmail),
-        redisService.del(existingUserCacheKey),
-      ]);
 
       const otp = otpService.generateOTP();
       const verificationToken = generateVerificationToken();
@@ -225,28 +213,26 @@ export const registerUser = asyncHandler(async (req, res) => {
       await Promise.all([
         otpService.storeOTP(normalizedEmail, otp, 10),
         storeVerificationToken(verificationToken, normalizedEmail, 30),
+        redisService.setJSON(`user:${normalizedEmail}`, result, { ex: 900 }),
+        redisService.del(`user:${normalizedEmail}:cache`),
+        emailService.sendOTPVerification({
+          email: normalizedEmail,
+          firstName: result.firstName,
+          otp,
+          expiresIn: 10,
+          isRegistration: true,
+          actionUrl: `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`,
+        }),
+        notificationService.createNotification({
+          userId: result.id,
+          type: "SYSTEM_ANNOUNCEMENT",
+          title: "Welcome to Educademy",
+          message: "Please verify your email to complete registration.",
+          priority: "HIGH",
+          sendEmail: false,
+          sendSocket: false,
+        }),
       ]);
-
-      const emailPromise = emailService.sendOTPVerification({
-        email: normalizedEmail,
-        firstName: result.firstName,
-        otp,
-        expiresIn: 10,
-        isRegistration: true,
-        actionUrl: `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`,
-      });
-
-      const notificationPromise = notificationService.createNotification({
-        userId: result.id,
-        type: "SYSTEM_ANNOUNCEMENT",
-        title: "Welcome to Educademy",
-        message: "Please verify your email to complete registration.",
-        priority: "HIGH",
-        sendEmail: false,
-        sendSocket: false,
-      });
-
-      await Promise.allSettled([emailPromise, notificationPromise]);
 
       const executionTime = performance.now() - startTime;
 
@@ -304,6 +290,7 @@ export const loginUser = asyncHandler(async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    console.time(`LOGIN_STEP_1_VALIDATION_${requestId}`);
     const validationResult = validateLoginInput({ email, password });
     if (!validationResult.isValid) {
       return res.status(400).json({
@@ -313,9 +300,11 @@ export const loginUser = asyncHandler(async (req, res) => {
         code: "VALIDATION_ERROR",
       });
     }
+    console.timeEnd(`LOGIN_STEP_1_VALIDATION_${requestId}`);
 
     const normalizedEmail = email.toLowerCase().trim();
 
+    console.time(`LOGIN_STEP_2_TOKEN_CHECK_${requestId}`);
     const existingToken = getTokenFromHeader(req);
     if (existingToken) {
       const existingSession = await redisService.getJSON(
@@ -329,12 +318,14 @@ export const loginUser = asyncHandler(async (req, res) => {
         });
       }
     }
+    console.timeEnd(`LOGIN_STEP_2_TOKEN_CHECK_${requestId}`);
 
-    const rateLimitResult = await redisService.rateLimitCheck(
-      `login:${req.ip}`,
-      10,
-      3600
-    );
+    console.time(`LOGIN_STEP_3_PARALLEL_CHECKS_${requestId}`);
+    const [rateLimitResult, cachedUser] = await Promise.all([
+      redisService.rateLimitCheck(`login:${req.ip}`, 10, 3600),
+      redisService.getJSON(`user:${normalizedEmail}`),
+    ]);
+    console.timeEnd(`LOGIN_STEP_3_PARALLEL_CHECKS_${requestId}`);
 
     if (!rateLimitResult.allowed) {
       return res.status(429).json({
@@ -345,10 +336,10 @@ export const loginUser = asyncHandler(async (req, res) => {
       });
     }
 
-    const userCacheKey = `user:${normalizedEmail}`;
-    let user = await redisService.getJSON(userCacheKey);
+    let user = cachedUser;
 
     if (!user) {
+      console.time(`LOGIN_STEP_4_DB_USER_LOOKUP_${requestId}`);
       user = await prisma.user.findUnique({
         where: { email: normalizedEmail },
         select: {
@@ -359,29 +350,25 @@ export const loginUser = asyncHandler(async (req, res) => {
           passwordHash: true,
           role: true,
           profileImage: true,
-          bio: true,
           isVerified: true,
           isActive: true,
           isBanned: true,
           bannedAt: true,
           banReason: true,
-          timezone: true,
-          language: true,
-          country: true,
-          phoneNumber: true,
-          dateOfBirth: true,
-          website: true,
-          linkedinProfile: true,
-          twitterProfile: true,
-          githubProfile: true,
-          lastLogin: true,
-          createdAt: true,
-          updatedAt: true,
         },
       });
+      console.timeEnd(`LOGIN_STEP_4_DB_USER_LOOKUP_${requestId}`);
 
       if (user) {
-        await redisService.setJSON(userCacheKey, user, { ex: 900 });
+        setImmediate(async () => {
+          try {
+            await redisService.setJSON(`user:${normalizedEmail}`, user, {
+              ex: 900,
+            });
+          } catch (error) {
+            console.warn("Cache set failed:", error);
+          }
+        });
       }
     }
 
@@ -393,7 +380,10 @@ export const loginUser = asyncHandler(async (req, res) => {
       });
     }
 
+    console.time(`LOGIN_STEP_5_PASSWORD_CHECK_${requestId}`);
     const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
+    console.timeEnd(`LOGIN_STEP_5_PASSWORD_CHECK_${requestId}`);
+
     if (!isPasswordValid) {
       return res.status(401).json({
         success: false,
@@ -402,6 +392,7 @@ export const loginUser = asyncHandler(async (req, res) => {
       });
     }
 
+    console.time(`LOGIN_STEP_6_ACCOUNT_STATUS_${requestId}`);
     const accountStatusCheck = checkAccountStatus(user);
     if (!accountStatusCheck.isValid) {
       return res.status(accountStatusCheck.statusCode).json({
@@ -411,84 +402,78 @@ export const loginUser = asyncHandler(async (req, res) => {
         ...accountStatusCheck.additionalData,
       });
     }
+    console.timeEnd(`LOGIN_STEP_6_ACCOUNT_STATUS_${requestId}`);
 
+    console.time(`LOGIN_STEP_7_TOKEN_GENERATION_${requestId}`);
     const token = generateToken(user.id);
+    console.timeEnd(`LOGIN_STEP_7_TOKEN_GENERATION_${requestId}`);
 
-    const userResult = await prisma.$transaction(async (tx) => {
-      const updatedUser = await tx.user.update({
+    console.time(`LOGIN_STEP_8_SESSION_DATA_${requestId}`);
+    const sessionData = await createSessionData({
+      token,
+      userId: user.id,
+      deviceType: req.get("User-Agent")?.substring(0, 255) || "unknown",
+      ipAddress: req.ip || "127.0.0.1",
+      userAgent: req.get("User-Agent"),
+    });
+    console.timeEnd(`LOGIN_STEP_8_SESSION_DATA_${requestId}`);
+
+    console.time(`LOGIN_STEP_9_DB_TRANSACTION_${requestId}`);
+    const session = await prisma.$transaction(async (tx) => {
+      await tx.user.update({
         where: { id: user.id },
         data: { lastLogin: new Date() },
+      });
+
+      return await tx.session.create({
+        data: sessionData,
         select: {
           id: true,
-          firstName: true,
-          lastName: true,
-          email: true,
-          role: true,
-          profileImage: true,
-          bio: true,
-          isVerified: true,
-          isActive: true,
-          timezone: true,
-          language: true,
-          country: true,
-          phoneNumber: true,
-          dateOfBirth: true,
-          website: true,
-          linkedinProfile: true,
-          twitterProfile: true,
-          githubProfile: true,
-          lastLogin: true,
+          expiresAt: true,
+          deviceType: true,
+          ipAddress: true,
           createdAt: true,
-          updatedAt: true,
         },
       });
-
-      const sessionData = await createSessionData({
-        token,
-        userId: user.id,
-        deviceType: req.get("User-Agent")?.substring(0, 255) || "unknown",
-        ipAddress: req.ip || "127.0.0.1",
-        userAgent: req.get("User-Agent"),
-      });
-
-      const session = await tx.session.create({
-        data: sessionData,
-      });
-
-      return { user: updatedUser, session };
     });
+    console.timeEnd(`LOGIN_STEP_9_DB_TRANSACTION_${requestId}`);
 
+    console.time(`LOGIN_STEP_10_REDIS_OPERATIONS_${requestId}`);
     await Promise.all([
       redisService.setJSON(
         `session:${token}`,
         {
-          userId: userResult.user.id,
-          sessionId: userResult.session.id,
-          createdAt: userResult.session.createdAt,
-          expiresAt: userResult.session.expiresAt,
-          deviceType: userResult.session.deviceType,
-          ipAddress: userResult.session.ipAddress,
+          userId: user.id,
+          sessionId: session.id,
+          createdAt: session.createdAt,
+          expiresAt: session.expiresAt,
+          deviceType: session.deviceType,
+          ipAddress: session.ipAddress,
           lastActivity: new Date(),
         },
         { ex: 30 * 24 * 60 * 60 }
       ),
-      redisService.sadd(`user_sessions:${userResult.user.id}`, token),
-      redisService.expire(
-        `user_sessions:${userResult.user.id}`,
-        30 * 24 * 60 * 60
-      ),
-      redisService.del(userCacheKey),
+      redisService.sadd(`user_sessions:${user.id}`, token),
+      redisService.expire(`user_sessions:${user.id}`, 30 * 24 * 60 * 60),
+      redisService.del(`user:${normalizedEmail}`),
     ]);
+    console.timeEnd(`LOGIN_STEP_10_REDIS_OPERATIONS_${requestId}`);
 
-    const securityPromise = handleLoginSecurity({
-      user: userResult.user,
-      session: userResult.session,
-      ipAddress: req.ip,
-      userAgent: req.get("User-Agent"),
-      location: req.get("CF-IPCountry") || "Unknown",
+    setImmediate(async () => {
+      try {
+        console.time(`LOGIN_STEP_11_SECURITY_BACKGROUND_${requestId}`);
+        await handleLoginSecurity({
+          user: { id: user.id, email: user.email, firstName: user.firstName },
+          session: session,
+          ipAddress: req.ip,
+          userAgent: req.get("User-Agent"),
+          location: req.get("CF-IPCountry") || "Unknown",
+        });
+        console.timeEnd(`LOGIN_STEP_11_SECURITY_BACKGROUND_${requestId}`);
+      } catch (error) {
+        console.warn("Security handling failed:", error);
+      }
     });
-
-    await Promise.allSettled([securityPromise]);
 
     const executionTime = performance.now() - startTime;
 
@@ -496,35 +481,21 @@ export const loginUser = asyncHandler(async (req, res) => {
       success: true,
       message: "Login successful",
       data: {
-        user: {
-          id: userResult.user.id,
-          firstName: userResult.user.firstName,
-          lastName: userResult.user.lastName,
-          email: userResult.user.email,
-          role: userResult.user.role,
-          profileImage: userResult.user.profileImage,
-          bio: userResult.user.bio,
-          isVerified: userResult.user.isVerified,
-          isActive: userResult.user.isActive,
-          timezone: userResult.user.timezone,
-          language: userResult.user.language,
-          country: userResult.user.country,
-          phoneNumber: userResult.user.phoneNumber,
-          dateOfBirth: userResult.user.dateOfBirth,
-          website: userResult.user.website,
-          linkedinProfile: userResult.user.linkedinProfile,
-          twitterProfile: userResult.user.twitterProfile,
-          githubProfile: userResult.user.githubProfile,
-          lastLogin: userResult.user.lastLogin,
-          createdAt: userResult.user.createdAt,
-          updatedAt: userResult.user.updatedAt,
-          needsProfileData: true,
-        },
         token,
+        user: {
+          id: user.id,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          email: user.email,
+          role: user.role,
+          profileImage: user.profileImage,
+          isVerified: user.isVerified,
+          isActive: user.isActive,
+        },
         sessionInfo: {
-          expiresAt: userResult.session.expiresAt,
-          deviceType: userResult.session.deviceType,
-          ipAddress: userResult.session.ipAddress,
+          expiresAt: session.expiresAt,
+          deviceType: session.deviceType,
+          ipAddress: session.ipAddress,
         },
       },
       meta: {
@@ -657,7 +628,6 @@ export const verifyUser = asyncHandler(async (req, res) => {
   try {
     const { email, otp, token } = req.body;
 
-    // Improved validation logic
     if (!token && (!email || !otp)) {
       return res.status(400).json({
         success: false,
@@ -687,30 +657,20 @@ export const verifyUser = asyncHandler(async (req, res) => {
     let verificationResult;
     let userEmail;
 
-    // Token-based verification
     if (token) {
-      console.log(`🔗 Verifying with token: ${token.substring(0, 10)}...`);
-
       try {
         verificationResult = await verifyByToken(token);
         userEmail = verificationResult.email;
-        console.log(`✅ Token verification successful for: ${userEmail}`);
       } catch (error) {
-        console.error(`❌ Token verification failed:`, error);
         return res.status(400).json({
           success: false,
           message: "Invalid or expired verification token",
           code: "INVALID_TOKEN",
         });
       }
-    }
-    // OTP-based verification
-    else {
-      console.log(`🔢 Verifying with OTP for email: ${email}`);
-
+    } else {
       const normalizedEmail = email.toLowerCase().trim();
 
-      // Validate OTP format
       if (!/^\d{6}$/.test(otp)) {
         return res.status(400).json({
           success: false,
@@ -721,12 +681,7 @@ export const verifyUser = asyncHandler(async (req, res) => {
       }
 
       try {
-        console.log(
-          `🔍 Calling otpService.verifyOTP with email: ${normalizedEmail}, otp: ${otp}`
-        );
-
         const otpResult = await otpService.verifyOTP(normalizedEmail, otp);
-        console.log(`📋 OTP verification result:`, otpResult);
 
         if (!otpResult || !otpResult.success) {
           return res.status(400).json({
@@ -740,9 +695,7 @@ export const verifyUser = asyncHandler(async (req, res) => {
 
         verificationResult = { success: true, email: normalizedEmail };
         userEmail = normalizedEmail;
-        console.log(`✅ OTP verification successful for: ${userEmail}`);
       } catch (error) {
-        console.error(`❌ OTP verification error:`, error);
         return res.status(500).json({
           success: false,
           message: "OTP verification service error",
@@ -753,7 +706,6 @@ export const verifyUser = asyncHandler(async (req, res) => {
       }
     }
 
-    // Final verification check
     if (!verificationResult || !verificationResult.success) {
       return res.status(400).json({
         success: false,
@@ -762,13 +714,20 @@ export const verifyUser = asyncHandler(async (req, res) => {
       });
     }
 
-    console.log(`🎯 Processing verification for user: ${userEmail}`);
+    let existingUser = await redisService.getJSON(`user:${userEmail}`);
 
-    // Check if user exists
-    const existingUser = await prisma.user.findUnique({
-      where: { email: userEmail },
-      select: { id: true, isVerified: true, isActive: true },
-    });
+    if (!existingUser) {
+      existingUser = await prisma.user.findUnique({
+        where: { email: userEmail },
+        select: { id: true, isVerified: true, isActive: true },
+      });
+
+      if (existingUser) {
+        await redisService.setJSON(`user:${userEmail}`, existingUser, {
+          ex: 900,
+        });
+      }
+    }
 
     if (!existingUser) {
       return res.status(404).json({
@@ -794,7 +753,15 @@ export const verifyUser = asyncHandler(async (req, res) => {
       });
     }
 
-    // Update user and create session
+    const authToken = generateToken(existingUser.id);
+    const sessionData = await createSessionData({
+      token: authToken,
+      userId: existingUser.id,
+      deviceType: token ? "email_link_verification" : "otp_verification",
+      ipAddress: req.ip || "127.0.0.1",
+      userAgent: req.get("User-Agent"),
+    });
+
     const userResult = await prisma.$transaction(async (tx) => {
       const updatedUser = await tx.user.update({
         where: { email: userEmail },
@@ -827,30 +794,18 @@ export const verifyUser = asyncHandler(async (req, res) => {
         },
       });
 
-      const authToken = generateToken(updatedUser.id);
-
-      const sessionData = await createSessionData({
-        token: authToken,
-        userId: updatedUser.id,
-        deviceType: token ? "email_link_verification" : "otp_verification",
-        ipAddress: req.ip || "127.0.0.1",
-        userAgent: req.get("User-Agent"),
-      });
-
       const session = await tx.session.create({
         data: sessionData,
       });
 
-      return { user: updatedUser, token: authToken, session };
+      return { user: updatedUser, session };
     });
 
-    console.log(`🎉 User verification completed for: ${userResult.user.id}`);
-
-    // Cache management and cleanup
     const cleanupPromises = [
-      clearUserCaches(userEmail, userResult.user.id),
+      redisService.del(`user:${userEmail}`),
+      redisService.del(`user:${userResult.user.id}:cache`),
       redisService.setJSON(
-        `session:${userResult.token}`,
+        `session:${authToken}`,
         {
           userId: userResult.user.id,
           sessionId: userResult.session.id,
@@ -862,33 +817,26 @@ export const verifyUser = asyncHandler(async (req, res) => {
         },
         { ex: 30 * 24 * 60 * 60 }
       ),
-      redisService.sadd(
-        `user_sessions:${userResult.user.id}`,
-        userResult.token
-      ),
+      redisService.sadd(`user_sessions:${userResult.user.id}`, authToken),
       redisService.expire(
         `user_sessions:${userResult.user.id}`,
         30 * 24 * 60 * 60
       ),
     ];
 
-    // Clean up verification data
     if (token) {
       cleanupPromises.push(redisService.del(`verification_token:${token}`));
     } else {
-      // Clean up OTP data
       cleanupPromises.push(otpService.clearOTP(userEmail));
     }
 
-    await Promise.all(cleanupPromises);
-
-    // Send welcome notifications
-    const welcomePromises = sendWelcomeNotifications({
-      user: userResult.user,
-      isNewUser: true,
-    });
-
-    await Promise.allSettled(welcomePromises);
+    await Promise.all([
+      ...cleanupPromises,
+      ...sendWelcomeNotifications({
+        user: userResult.user,
+        isNewUser: true,
+      }),
+    ]);
 
     const executionTime = performance.now() - startTime;
 
@@ -896,31 +844,7 @@ export const verifyUser = asyncHandler(async (req, res) => {
       success: true,
       message: "Email verified successfully! Welcome to Educademy.",
       data: {
-        user: {
-          id: userResult.user.id,
-          firstName: userResult.user.firstName,
-          lastName: userResult.user.lastName,
-          email: userResult.user.email,
-          role: userResult.user.role,
-          profileImage: userResult.user.profileImage,
-          bio: userResult.user.bio,
-          isVerified: userResult.user.isVerified,
-          isActive: userResult.user.isActive,
-          timezone: userResult.user.timezone,
-          language: userResult.user.language,
-          country: userResult.user.country,
-          phoneNumber: userResult.user.phoneNumber,
-          dateOfBirth: userResult.user.dateOfBirth,
-          website: userResult.user.website,
-          linkedinProfile: userResult.user.linkedinProfile,
-          twitterProfile: userResult.user.twitterProfile,
-          githubProfile: userResult.user.githubProfile,
-          lastLogin: userResult.user.lastLogin,
-          createdAt: userResult.user.createdAt,
-          updatedAt: userResult.user.updatedAt,
-          needsProfileData: true,
-        },
-        token: userResult.token,
+        token: authToken,
         sessionInfo: {
           expiresAt: userResult.session.expiresAt,
           deviceType: userResult.session.deviceType,
@@ -1702,13 +1626,6 @@ export const googleAuthCallback = asyncHandler(async (req, res, next) => {
       const authCode = await createTempAuthCode(user.id);
       const executionTime = performance.now() - startTime;
 
-      console.log(`GOOGLE_AUTH_SUCCESS [${requestId}]:`, {
-        userId: user.id,
-        email: user.email,
-        isNewUser: !user.socialLogins?.find((l) => l.provider === "google"),
-        executionTime: Math.round(executionTime),
-      });
-
       res.redirect(
         `${process.env.FRONTEND_URL}/auth/callback?code=${authCode}&success=true&provider=google`
       );
@@ -1899,13 +1816,6 @@ export const gitHubAuthCallback = asyncHandler(async (req, res, next) => {
 
       const authCode = await createTempAuthCode(user.id);
       const executionTime = performance.now() - startTime;
-
-      console.log(`GITHUB_AUTH_SUCCESS [${requestId}]:`, {
-        userId: user.id,
-        email: user.email,
-        isNewUser: !user.socialLogins?.find((l) => l.provider === "github"),
-        executionTime: Math.round(executionTime),
-      });
 
       res.redirect(
         `${process.env.FRONTEND_URL}/auth/callback?code=${authCode}&success=true&provider=github`
@@ -2841,8 +2751,6 @@ export const invalidateAllSessions = asyncHandler(async (req, res) => {
 
     const executionTime = performance.now() - startTime;
 
-    console.log(`SESSION_INVALIDATION [${requestId}]:`, securityLog);
-
     res.status(200).json({
       success: true,
       message: keepCurrent
@@ -3556,16 +3464,6 @@ export const deleteAccount = asyncHandler(async (req, res) => {
     await Promise.allSettled([confirmationPromise]);
 
     const executionTime = performance.now() - startTime;
-
-    console.log(`ACCOUNT_DELETED [${requestId}]:`, {
-      userId: user.id,
-      email: user.email,
-      role: user.role,
-      reason,
-      deletedAt: new Date().toISOString(),
-      dataCleared: deletionData.dataCleared,
-      sessionsInvalidated: deletionData.sessionsInvalidated,
-    });
 
     res.status(200).json({
       success: true,

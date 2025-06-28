@@ -181,8 +181,31 @@ export const createSection = asyncHandler(async (req, res) => {
       });
     }
 
-    const hasAccess = await validateCourseOwnership(courseId, instructorId);
-    if (!hasAccess) {
+    const parsedEstimatedTime = estimatedTime ? parseInt(estimatedTime) : null;
+    if (
+      estimatedTime &&
+      (isNaN(parsedEstimatedTime) || parsedEstimatedTime < 0)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Estimated time must be a valid positive number in minutes",
+        code: "VALIDATION_ERROR",
+      });
+    }
+
+    const [course, lastSection] = await Promise.all([
+      prisma.course.findUnique({
+        where: { id: courseId, instructorId },
+        select: { id: true, sectionsCount: true },
+      }),
+      prisma.section.findFirst({
+        where: { courseId },
+        orderBy: { order: "desc" },
+        select: { order: true },
+      }),
+    ]);
+
+    if (!course) {
       return res.status(403).json({
         success: false,
         message: "Access denied. You don't own this course.",
@@ -190,32 +213,80 @@ export const createSection = asyncHandler(async (req, res) => {
       });
     }
 
-    const lastSection = await prisma.section.findFirst({
-      where: { courseId },
-      orderBy: { order: "desc" },
-    });
-
     const newOrder = lastSection ? lastSection.order + 1 : 1;
 
-    const section = await prisma.section.create({
-      data: {
-        title: title.trim(),
-        description: description?.trim(),
-        order: newOrder,
-        isPublished,
-        estimatedTime: estimatedTime || null,
-        courseId,
-      },
-    });
+    const [section, updatedCourse] = await Promise.all([
+      prisma.section.create({
+        data: {
+          title: title.trim(),
+          description: description?.trim() || null,
+          order: newOrder,
+          isPublished,
+          estimatedTime: parsedEstimatedTime,
+          courseId,
+        },
+        select: {
+          id: true,
+          title: true,
+          description: true,
+          order: true,
+          isPublished: true,
+          estimatedTime: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      }),
+      prisma.course.update({
+        where: { id: courseId },
+        data: {
+          sectionsCount: (course.sectionsCount || 0) + 1,
+          lastUpdated: new Date(),
+        },
+        select: { sectionsCount: true },
+      }),
+    ]);
 
-    await clearContentCache(courseId);
+    setImmediate(async () => {
+      try {
+        await Promise.all([
+          clearContentCache(courseId),
+          redisService.delPattern(`course:${courseId}*`),
+          redisService.delPattern(`sections:${courseId}*`),
+        ]);
+      } catch (cacheError) {
+        console.warn("Cache cleanup failed:", cacheError);
+      }
+    });
 
     const executionTime = performance.now() - startTime;
 
     res.status(201).json({
       success: true,
       message: "Section created successfully",
-      data: { section },
+      data: {
+        section: {
+          id: section.id,
+          title: section.title,
+          description: section.description,
+          order: section.order,
+          isPublished: section.isPublished,
+          estimatedTimeMinutes: section.estimatedTime,
+          estimatedTime: section.estimatedTime
+            ? {
+                value: section.estimatedTime,
+                unit: "minutes",
+                display: `${section.estimatedTime} minutes`,
+                formatted: formatDuration(section.estimatedTime),
+              }
+            : null,
+          createdAt: section.createdAt,
+          updatedAt: section.updatedAt,
+          courseId,
+        },
+        course: {
+          sectionsCount: updatedCourse.sectionsCount,
+        },
+      },
       meta: {
         requestId,
         executionTime: Math.round(executionTime),
@@ -244,6 +315,23 @@ export const createSection = asyncHandler(async (req, res) => {
     });
   }
 });
+
+const formatDuration = (minutes) => {
+  if (!minutes || minutes === 0) return "0 minutes";
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+
+  if (hours === 0) {
+    return `${remainingMinutes} minute${remainingMinutes !== 1 ? "s" : ""}`;
+  } else if (remainingMinutes === 0) {
+    return `${hours} hour${hours !== 1 ? "s" : ""}`;
+  } else {
+    return `${hours} hour${hours !== 1 ? "s" : ""} ${remainingMinutes} minute${
+      remainingMinutes !== 1 ? "s" : ""
+    }`;
+  }
+};
 
 export const updateSection = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();
@@ -2309,170 +2397,6 @@ export const deleteLessonAttachment = asyncHandler(async (req, res) => {
   }
 });
 
-export const duplicateSection = asyncHandler(async (req, res) => {
-  const requestId = generateRequestId();
-  const startTime = performance.now();
-
-  try {
-    const { sectionId } = req.params;
-    const { newTitle } = req.body;
-    const instructorId = req.instructorProfile.id;
-
-    const originalSection = await prisma.section.findUnique({
-      where: { id: sectionId },
-      include: {
-        course: true,
-        lessons: {
-          include: {
-            attachments: true,
-          },
-        },
-        quizzes: {
-          include: {
-            questions: true,
-          },
-        },
-        assignments: true,
-      },
-    });
-
-    if (!originalSection) {
-      return res.status(404).json({
-        success: false,
-        message: "Section not found",
-        code: "SECTION_NOT_FOUND",
-      });
-    }
-
-    if (originalSection.course.instructorId !== instructorId) {
-      return res.status(403).json({
-        success: false,
-        message: "Access denied. You don't own this course.",
-        code: "COURSE_ACCESS_DENIED",
-      });
-    }
-
-    const lastSection = await prisma.section.findFirst({
-      where: { courseId: originalSection.courseId },
-      orderBy: { order: "desc" },
-    });
-
-    const newOrder = lastSection ? lastSection.order + 1 : 1;
-
-    const duplicatedSection = await prisma.section.create({
-      data: {
-        title: newTitle || `${originalSection.title} (Copy)`,
-        description: originalSection.description,
-        order: newOrder,
-        isPublished: false,
-        isRequired: originalSection.isRequired,
-        isFree: originalSection.isFree,
-        estimatedTime: originalSection.estimatedTime,
-        courseId: originalSection.courseId,
-      },
-    });
-
-    const duplicateLessons = originalSection.lessons.map((lesson, index) => ({
-      title: lesson.title,
-      description: lesson.description,
-      order: index + 1,
-      duration: lesson.duration,
-      isFree: lesson.isFree,
-      isPreview: lesson.isPreview,
-      type: lesson.type,
-      content: lesson.content,
-      videoUrl: lesson.videoUrl,
-      transcript: lesson.transcript,
-      resources: lesson.resources,
-      sectionId: duplicatedSection.id,
-    }));
-
-    if (duplicateLessons.length > 0) {
-      await prisma.lesson.createMany({
-        data: duplicateLessons,
-      });
-    }
-
-    const duplicateQuizzes = originalSection.quizzes.map((quiz, index) => ({
-      title: quiz.title,
-      description: quiz.description,
-      instructions: quiz.instructions,
-      duration: quiz.duration,
-      passingScore: quiz.passingScore,
-      maxAttempts: quiz.maxAttempts,
-      order: index + 1,
-      isRequired: quiz.isRequired,
-      isRandomized: quiz.isRandomized,
-      showResults: quiz.showResults,
-      allowReview: quiz.allowReview,
-      sectionId: duplicatedSection.id,
-    }));
-
-    if (duplicateQuizzes.length > 0) {
-      await prisma.quiz.createMany({
-        data: duplicateQuizzes,
-      });
-    }
-
-    const duplicateAssignments = originalSection.assignments.map(
-      (assignment, index) => ({
-        title: assignment.title,
-        description: assignment.description,
-        instructions: assignment.instructions,
-        dueDate: assignment.dueDate,
-        totalPoints: assignment.totalPoints,
-        order: index + 1,
-        resources: assignment.resources,
-        rubric: assignment.rubric,
-        allowLateSubmission: assignment.allowLateSubmission,
-        latePenalty: assignment.latePenalty,
-        sectionId: duplicatedSection.id,
-      })
-    );
-
-    if (duplicateAssignments.length > 0) {
-      await prisma.assignment.createMany({
-        data: duplicateAssignments,
-      });
-    }
-
-    await clearContentCache(originalSection.courseId);
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(201).json({
-      success: true,
-      message: "Section duplicated successfully",
-      data: { section: duplicatedSection },
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error(`DUPLICATE_SECTION_ERROR [${requestId}]:`, {
-      error: error.message,
-      stack: error.stack,
-      sectionId: req.params.sectionId,
-      instructorId: req.instructorProfile?.id,
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to duplicate section",
-      code: "DUPLICATE_SECTION_ERROR",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
 export const getContentStats = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();
   const startTime = performance.now();
@@ -2599,6 +2523,24 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
     const { courseId } = req.params;
     const instructorId = req.instructorProfile.id;
 
+    const cacheKey = `course_content_validation:${courseId}`;
+    const cachedResult = await redisService.getJSON(cacheKey);
+
+    if (cachedResult) {
+      const executionTime = performance.now() - startTime;
+      return res.status(200).json({
+        success: true,
+        message: "Content validation completed",
+        data: cachedResult,
+        meta: {
+          requestId,
+          executionTime: Math.round(executionTime),
+          timestamp: new Date().toISOString(),
+          cached: true,
+        },
+      });
+    }
+
     const hasAccess = await validateCourseOwnership(courseId, instructorId);
     if (!hasAccess) {
       return res.status(403).json({
@@ -2608,22 +2550,74 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
       });
     }
 
-    const course = await prisma.course.findUnique({
-      where: { id: courseId },
-      include: {
-        sections: {
-          include: {
-            lessons: true,
-            quizzes: {
-              include: {
-                questions: true,
-              },
-            },
-            assignments: true,
-          },
+    const [
+      sectionsData,
+      lessonsData,
+      quizzesData,
+      questionsData,
+      assignmentsData,
+    ] = await Promise.all([
+      prisma.section.findMany({
+        where: { courseId },
+        select: {
+          id: true,
+          title: true,
+          isPublished: true,
+          order: true,
         },
-      },
-    });
+        orderBy: { order: "asc" },
+      }),
+      prisma.lesson.findMany({
+        where: { section: { courseId } },
+        select: {
+          id: true,
+          title: true,
+          type: true,
+          videoUrl: true,
+          duration: true,
+          isFree: true,
+          isPreview: true,
+          sectionId: true,
+          order: true,
+        },
+        orderBy: [{ sectionId: "asc" }, { order: "asc" }],
+      }),
+      prisma.quiz.findMany({
+        where: { section: { courseId } },
+        select: {
+          id: true,
+          title: true,
+          passingScore: true,
+          sectionId: true,
+          order: true,
+        },
+        orderBy: [{ sectionId: "asc" }, { order: "asc" }],
+      }),
+      prisma.question.findMany({
+        where: { quiz: { section: { courseId } } },
+        select: {
+          id: true,
+          type: true,
+          options: true,
+          correctAnswer: true,
+          quizId: true,
+          order: true,
+        },
+        orderBy: [{ quizId: "asc" }, { order: "asc" }],
+      }),
+      prisma.assignment.findMany({
+        where: { section: { courseId } },
+        select: {
+          id: true,
+          title: true,
+          instructions: true,
+          totalPoints: true,
+          sectionId: true,
+          order: true,
+        },
+        orderBy: [{ sectionId: "asc" }, { order: "asc" }],
+      }),
+    ]);
 
     const validationResults = {
       isValid: true,
@@ -2632,20 +2626,67 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
       suggestions: [],
     };
 
-    if (!course.sections || course.sections.length === 0) {
+    if (sectionsData.length === 0) {
       validationResults.errors.push("Course must have at least one section");
       validationResults.isValid = false;
     }
 
-    let totalLessons = 0;
-    let totalDuration = 0;
-    let hasPublishedSection = false;
+    let totalLessons = lessonsData.length;
+    let totalDuration = lessonsData.reduce(
+      (sum, lesson) => sum + (lesson.duration || 0),
+      0
+    );
+    let hasPublishedSection = sectionsData.some(
+      (section) => section.isPublished
+    );
 
-    course.sections.forEach((section, sectionIndex) => {
-      if (section.isPublished) {
-        hasPublishedSection = true;
+    const sectionMap = new Map();
+    sectionsData.forEach((section, index) => {
+      sectionMap.set(section.id, {
+        ...section,
+        index: index + 1,
+        lessons: [],
+        quizzes: [],
+        assignments: [],
+      });
+    });
+
+    lessonsData.forEach((lesson) => {
+      const section = sectionMap.get(lesson.sectionId);
+      if (section) {
+        section.lessons.push(lesson);
       }
+    });
 
+    quizzesData.forEach((quiz) => {
+      const section = sectionMap.get(quiz.sectionId);
+      if (section) {
+        section.quizzes.push({ ...quiz, questions: [] });
+      }
+    });
+
+    assignmentsData.forEach((assignment) => {
+      const section = sectionMap.get(assignment.sectionId);
+      if (section) {
+        section.assignments.push(assignment);
+      }
+    });
+
+    const quizMap = new Map();
+    sectionMap.forEach((section) => {
+      section.quizzes.forEach((quiz) => {
+        quizMap.set(quiz.id, quiz);
+      });
+    });
+
+    questionsData.forEach((question) => {
+      const quiz = quizMap.get(question.quizId);
+      if (quiz) {
+        quiz.questions.push(question);
+      }
+    });
+
+    sectionMap.forEach((section) => {
       if (section.lessons.length === 0) {
         validationResults.warnings.push(
           `Section "${section.title}" has no lessons`
@@ -2653,51 +2694,38 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
       }
 
       section.lessons.forEach((lesson, lessonIndex) => {
-        totalLessons++;
-        totalDuration += lesson.duration;
-
         if (!lesson.title || lesson.title.trim().length === 0) {
           validationResults.errors.push(
-            `Section ${sectionIndex + 1}, Lesson ${
-              lessonIndex + 1
-            }: Missing title`
+            `Section ${section.index}, Lesson ${lessonIndex + 1}: Missing title`
           );
           validationResults.isValid = false;
         }
 
         if (lesson.type === "VIDEO" && !lesson.videoUrl) {
           validationResults.errors.push(
-            `Section ${sectionIndex + 1}, Lesson "${
-              lesson.title
-            }": Video lessons must have video URL`
+            `Section ${section.index}, Lesson "${lesson.title}": Video lessons must have video URL`
           );
           validationResults.isValid = false;
         }
 
-        if (lesson.duration < 60) {
+        if (lesson.duration && lesson.duration < 60) {
           validationResults.warnings.push(
-            `Section ${sectionIndex + 1}, Lesson "${
-              lesson.title
-            }": Very short duration (${lesson.duration}s)`
+            `Section ${section.index}, Lesson "${lesson.title}": Very short duration (${lesson.duration}s)`
           );
         }
       });
 
-      section.quizzes.forEach((quiz, quizIndex) => {
+      section.quizzes.forEach((quiz) => {
         if (quiz.questions.length === 0) {
           validationResults.errors.push(
-            `Section ${sectionIndex + 1}, Quiz "${
-              quiz.title
-            }": Must have at least one question`
+            `Section ${section.index}, Quiz "${quiz.title}": Must have at least one question`
           );
           validationResults.isValid = false;
         }
 
         if (quiz.passingScore > 100) {
           validationResults.errors.push(
-            `Section ${sectionIndex + 1}, Quiz "${
-              quiz.title
-            }": Passing score cannot exceed 100%`
+            `Section ${section.index}, Quiz "${quiz.title}": Passing score cannot exceed 100%`
           );
           validationResults.isValid = false;
         }
@@ -2705,7 +2733,7 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
         quiz.questions.forEach((question, questionIndex) => {
           if (question.type === "MULTIPLE_CHOICE" && !question.options) {
             validationResults.errors.push(
-              `Section ${sectionIndex + 1}, Quiz "${quiz.title}", Question ${
+              `Section ${section.index}, Quiz "${quiz.title}", Question ${
                 questionIndex + 1
               }: Multiple choice questions must have options`
             );
@@ -2714,7 +2742,7 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
 
           if (!question.correctAnswer) {
             validationResults.errors.push(
-              `Section ${sectionIndex + 1}, Quiz "${quiz.title}", Question ${
+              `Section ${section.index}, Quiz "${quiz.title}", Question ${
                 questionIndex + 1
               }: Must have correct answer`
             );
@@ -2723,23 +2751,19 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
         });
       });
 
-      section.assignments.forEach((assignment, assignmentIndex) => {
+      section.assignments.forEach((assignment) => {
         if (
           !assignment.instructions ||
           assignment.instructions.trim().length < 50
         ) {
           validationResults.warnings.push(
-            `Section ${sectionIndex + 1}, Assignment "${
-              assignment.title
-            }": Instructions should be more detailed`
+            `Section ${section.index}, Assignment "${assignment.title}": Instructions should be more detailed`
           );
         }
 
         if (assignment.totalPoints <= 0) {
           validationResults.errors.push(
-            `Section ${sectionIndex + 1}, Assignment "${
-              assignment.title
-            }": Must have positive total points`
+            `Section ${section.index}, Assignment "${assignment.title}": Must have positive total points`
           );
           validationResults.isValid = false;
         }
@@ -2767,8 +2791,8 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
       );
     }
 
-    const hasFreeContent = course.sections.some((section) =>
-      section.lessons.some((lesson) => lesson.isFree || lesson.isPreview)
+    const hasFreeContent = lessonsData.some(
+      (lesson) => lesson.isFree || lesson.isPreview
     );
 
     if (!hasFreeContent) {
@@ -2778,26 +2802,37 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
     }
 
     const validationSummary = {
-      totalSections: course.sections.length,
+      totalSections: sectionsData.length,
       totalLessons,
       totalDuration: Math.round(totalDuration / 60),
-      publishedSections: course.sections.filter((s) => s.isPublished).length,
+      publishedSections: sectionsData.filter((s) => s.isPublished).length,
       readyForReview: validationResults.isValid && hasPublishedSection,
     };
+
+    const result = {
+      validation: validationResults,
+      summary: validationSummary,
+    };
+
+    setImmediate(async () => {
+      try {
+        await redisService.setJSON(cacheKey, result, { ex: 900 });
+      } catch (cacheError) {
+        console.warn("Failed to cache validation result:", cacheError);
+      }
+    });
 
     const executionTime = performance.now() - startTime;
 
     res.status(200).json({
       success: true,
       message: "Content validation completed",
-      data: {
-        validation: validationResults,
-        summary: validationSummary,
-      },
+      data: result,
       meta: {
         requestId,
         executionTime: Math.round(executionTime),
         timestamp: new Date().toISOString(),
+        cached: false,
       },
     });
   } catch (error) {
@@ -2822,6 +2857,22 @@ export const validateCourseContent = asyncHandler(async (req, res) => {
     });
   }
 });
+
+export const invalidateCourseValidationCache = async (courseId) => {
+  try {
+    const patterns = [
+      `course_content_validation:${courseId}`,
+      `course_validation:${courseId}`,
+      `course:${courseId}:*`,
+    ];
+
+    await Promise.all(
+      patterns.map((pattern) => redisService.delPattern(pattern))
+    );
+  } catch (error) {
+    console.warn("Cache invalidation failed:", error);
+  }
+};
 
 export const publishAllSections = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();

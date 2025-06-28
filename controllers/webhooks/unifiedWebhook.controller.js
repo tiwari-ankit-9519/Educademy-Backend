@@ -1,7 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import crypto from "crypto";
 import asyncHandler from "express-async-handler";
-import paymentService from "../../services/paymentService.js";
+import paymentService from "../../utils/paymentService.js";
 import emailService from "../../utils/emailService.js";
 import notificationService from "../../utils/notificationservice.js";
 import redisService from "../../utils/redis.js";

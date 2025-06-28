@@ -60,11 +60,14 @@ model User {
   contentReports               ContentReport[]
   bannedByUser                 User?                   @relation("UserBans", fields: [bannedBy], references: [id])
   bannedUsers                  User[]                  @relation("UserBans")
+  reviewedVerificationRequests VerificationRequest[]   @relation("VerificationReviewer")
 
   @@index([email])
   @@index([role])
   @@index([isActive])
   @@index([isBanned])
+  @@index([role, isActive])
+  @@index([createdAt])
 }
 
 enum UserRole {
@@ -72,6 +75,80 @@ enum UserRole {
   INSTRUCTOR
   ADMIN
   MODERATOR
+}
+
+model VerificationRequest {
+  id                String                    @id @default(cuid())
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+  requestId         String                    @unique
+  verificationLevel VerificationLevel         @default(BASIC)
+  status            VerificationRequestStatus @default(PENDING)
+  priority          VerificationPriority      @default(NORMAL)
+  submittedAt       DateTime                  @default(now())
+  reviewedAt        DateTime?
+  reviewedBy        String?
+  adminNotes        String?                   @db.Text
+  rejectionReason   String?                   @db.Text
+  additionalInfo    String?                   @db.Text
+  documents         Json?
+  qualifications    Json?
+  experience        Json?
+  portfolio         Json?
+  references        Json?
+  instructorId      String
+  instructor        Instructor                @relation(fields: [instructorId], references: [id], onDelete: Cascade)
+  reviewedById      String?
+  reviewedByUser    User?                     @relation("VerificationReviewer", fields: [reviewedById], references: [id])
+
+  @@index([instructorId])
+  @@index([status])
+  @@index([verificationLevel])
+  @@index([priority])
+  @@index([submittedAt])
+  @@index([reviewedAt])
+  @@index([reviewedById])
+  @@index([requestId])
+  @@index([createdAt])
+  @@index([updatedAt])
+  @@index([status, priority])
+  @@index([status, verificationLevel])
+  @@index([status, submittedAt])
+  @@index([instructorId, status])
+  @@index([instructorId, verificationLevel])
+  @@index([instructorId, priority])
+  @@index([instructorId, status, verificationLevel])
+  @@index([instructorId, status, priority])
+  @@index([instructorId, createdAt])
+  @@index([instructorId, submittedAt])
+  @@index([reviewedById, reviewedAt])
+  @@index([priority, submittedAt])
+  @@index([verificationLevel, status])
+  @@index([verificationLevel, priority])
+  @@index([status, priority, submittedAt])
+  @@index([instructorId, status, submittedAt(sort: Desc)])
+  @@index([status, priority, verificationLevel])
+}
+
+enum VerificationLevel {
+  BASIC
+  PREMIUM
+  EXPERT
+}
+
+enum VerificationRequestStatus {
+  PENDING
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum VerificationPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
 }
 
 model SocialLogin {
@@ -85,6 +162,7 @@ model SocialLogin {
 
   @@unique([provider, providerId])
   @@index([userId])
+  @@index([provider])
 }
 
 model Session {
@@ -107,6 +185,7 @@ model Session {
   @@index([userId])
   @@index([token])
   @@index([isActive])
+  @@index([expiresAt])
 }
 
 model Student {
@@ -133,6 +212,7 @@ model Student {
 
   @@index([userId])
   @@index([skillLevel])
+  @@index([createdAt])
 }
 
 enum SkillLevel {
@@ -143,33 +223,37 @@ enum SkillLevel {
 }
 
 model Instructor {
-  id                String      @id @default(cuid())
-  createdAt         DateTime    @default(now())
-  updatedAt         DateTime    @updatedAt
-  title             String?
-  expertise         String[]
-  rating            Float?
-  totalStudents     Int         @default(0)
-  totalCourses      Int         @default(0)
-  totalRevenue      Decimal     @default(0) @db.Decimal(12, 2)
-  yearsExperience   Int?
-  education         String?
-  certifications    String[]
-  isVerified        Boolean     @default(false)
-  verificationBadge String?
-  biography         String?     @db.Text
-  paymentDetails    Json?
-  commissionRate    Float       @default(0.7)
-  userId            String      @unique
-  user              User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  courses           Course[]
-  earnings          Earning[]
-  payouts           Payout[]
-  qnaAnswers        QnAAnswer[]
+  id                   String                @id @default(cuid())
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  title                String?
+  expertise            String[]
+  rating               Float?
+  totalStudents        Int                   @default(0)
+  totalCourses         Int                   @default(0)
+  totalRevenue         Decimal               @default(0) @db.Decimal(12, 2)
+  yearsExperience      Int?
+  education            String?
+  certifications       String[]
+  isVerified           Boolean               @default(false)
+  verificationBadge    String?
+  biography            String?               @db.Text
+  paymentDetails       Json?
+  commissionRate       Float                 @default(0.7)
+  userId               String                @unique
+  user                 User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courses              Course[]
+  earnings             Earning[]
+  payouts              Payout[]
+  qnaAnswers           QnAAnswer[]
+  verificationRequests VerificationRequest[]
 
   @@index([userId])
   @@index([rating])
   @@index([isVerified])
+  @@index([totalStudents])
+  @@index([totalCourses])
+  @@index([createdAt])
 }
 
 model Admin {
@@ -235,6 +319,7 @@ model SupportTicket {
   @@index([priority])
   @@index([category])
   @@index([createdAt])
+  @@index([status, priority])
 }
 
 enum SupportTicketStatus {
@@ -278,6 +363,7 @@ model SupportTicketResponse {
   @@index([supportTicketId])
   @@index([userId])
   @@index([isStaffResponse])
+  @@index([createdAt])
 }
 
 model ContentReport {
@@ -300,6 +386,7 @@ model ContentReport {
   @@index([contentType])
   @@index([contentId])
   @@index([createdAt])
+  @@index([contentType, contentId])
 }
 
 enum ContentReportStatus {
@@ -336,6 +423,7 @@ model Payout {
   @@index([instructorId])
   @@index([status])
   @@index([requestedAt])
+  @@index([processedAt])
 }
 
 enum PayoutStatus {
@@ -347,68 +435,77 @@ enum PayoutStatus {
 }
 
 model Course {
-  id                 String           @id @default(cuid())
-  createdAt          DateTime         @default(now())
-  updatedAt          DateTime         @updatedAt
-  title              String
-  slug               String           @unique
-  description        String           @db.Text
-  shortDescription   String
-  thumbnail          String?
-  previewVideo       String?
-  introVideo         String?
-  price              Decimal          @db.Decimal(10, 2)
-  discountPrice      Decimal?         @db.Decimal(10, 2)
-  originalPrice      Decimal?         @db.Decimal(10, 2)
-  duration           Int
-  totalLessons       Int              @default(0)
-  totalQuizzes       Int              @default(0)
-  totalAssignments   Int              @default(0)
-  level              CourseLevel
-  status             CourseStatus     @default(DRAFT)
-  featured           Boolean          @default(false)
-  bestseller         Boolean          @default(false)
-  trending           Boolean          @default(false)
-  publishedAt        DateTime?
-  archivedAt         DateTime?
-  language           String           @default("English")
-  subtitles          String[]
-  requirements       String[]
-  tags               String[]
-  keyPoints          String[]
-  learningOutcomes   String[]
-  targetAudience     String[]
-  lastUpdated        DateTime?
-  reviewSubmittedAt  DateTime?
-  reviewerId         String?
-  reviewerFeedback   String?          @db.Text
-  rejectionReason    String?          @db.Text
-  averageRating      Float            @default(0)
-  totalRatings       Int              @default(0)
-  ratingDistribution Json?
-  totalEnrollments   Int              @default(0)
-  totalRevenue       Decimal          @default(0) @db.Decimal(12, 2)
-  completionRate     Float            @default(0)
-  difficulty         Float            @default(0)
-  instructorId       String
-  instructor         Instructor       @relation(fields: [instructorId], references: [id], onDelete: Cascade)
-  categoryId         String
-  category           Category         @relation(fields: [categoryId], references: [id])
-  subcategoryId      String?
-  subcategory        Category?        @relation("CourseSubcategory", fields: [subcategoryId], references: [id])
-  sections           Section[]
-  enrollments        Enrollment[]
-  reviews            Review[]
-  wishlistItems      WishlistItem[]
-  cartItems          CartItem[]
-  courseProgress     CourseProgress[]
-  courseSettings     CourseSettings?
-  coupons            Coupon[]
-  bookmarks          Bookmark[]
-  faqs               FAQ[]
-  certificates       Certificate[]
-  qnaQuestions       QnAQuestion[]
+  id                     String           @id @default(cuid())
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+  title                  String
+  slug                   String           @unique
+  description            String           @db.Text
+  shortDescription       String
+  thumbnail              String?
+  previewVideo           String?
+  introVideo             String?
+  price                  Decimal          @db.Decimal(10, 2)
+  discountPrice          Decimal?         @db.Decimal(10, 2)
+  discountPercentage     Float?
+  originalPrice          Decimal?         @db.Decimal(10, 2)
+  duration               Int
+  totalLessons           Int              @default(0)
+  totalQuizzes           Int              @default(0)
+  totalAssignments       Int              @default(0)
+  level                  CourseLevel
+  status                 CourseStatus     @default(DRAFT)
+  featured               Boolean          @default(false)
+  bestseller             Boolean          @default(false)
+  trending               Boolean          @default(false)
+  publishedAt            DateTime?
+  archivedAt             DateTime?
+  language               String           @default("English")
+  subtitles              String[]
+  requirements           String[]
+  tags                   String[]
+  keyPoints              String[]
+  learningOutcomes       String[]
+  targetAudience         String[]
+  lastUpdated            DateTime?
+  reviewSubmittedAt      DateTime?
+  reviewerId             String?
+  reviewerFeedback       String?          @db.Text
+  rejectionReason        String?          @db.Text
+  averageRating          Float            @default(0)
+  totalRatings           Int              @default(0)
+  ratingDistribution     Json?
+  totalEnrollments       Int              @default(0)
+  totalRevenue           Decimal          @default(0) @db.Decimal(12, 2)
+  completionRate         Float            @default(0)
+  difficulty             Float            @default(0)
+  instructorId           String
+  instructor             Instructor       @relation(fields: [instructorId], references: [id], onDelete: Cascade)
+  categoryId             String
+  category               Category         @relation(fields: [categoryId], references: [id])
+  subcategoryId          String?
+  subcategory            Category?        @relation("CourseSubcategory", fields: [subcategoryId], references: [id])
+  sections               Section[]
+  enrollments            Enrollment[]
+  reviews                Review[]
+  wishlistItems          WishlistItem[]
+  cartItems              CartItem[]
+  courseProgress         CourseProgress[]
+  courseSettings         CourseSettings?
+  coupons                Coupon[]
+  bookmarks              Bookmark[]
+  faqs                   FAQ[]
+  certificates           Certificate[]
+  qnaQuestions           QnAQuestion[]
+  sectionsCount          Int              @default(0)
+  publishedSectionsCount Int              @default(0)
+  enrollmentsCount       Int              @default(0)
+  reviewsCount           Int              @default(0)
 
+  @@index([sectionsCount])
+  @@index([publishedSectionsCount])
+  @@index([enrollmentsCount])
+  @@index([reviewsCount])
   @@index([instructorId])
   @@index([categoryId])
   @@index([subcategoryId])
@@ -422,6 +519,32 @@ model Course {
   @@index([trending])
   @@index([publishedAt])
   @@index([price])
+  @@index([totalEnrollments])
+  @@index([createdAt])
+  @@index([updatedAt])
+  @@index([instructorId, status])
+  @@index([instructorId, level])
+  @@index([instructorId, categoryId])
+  @@index([instructorId, status, level])
+  @@index([instructorId, status, categoryId])
+  @@index([instructorId, level, categoryId])
+  @@index([instructorId, status, level, categoryId])
+  @@index([instructorId, updatedAt(sort: Desc)])
+  @@index([instructorId, createdAt(sort: Desc)])
+  @@index([instructorId, publishedAt(sort: Desc)])
+  @@index([instructorId, averageRating(sort: Desc)])
+  @@index([instructorId, totalEnrollments(sort: Desc)])
+  @@index([instructorId, price(sort: Desc)])
+  @@index([instructorId, title])
+  @@index([instructorId, status, updatedAt(sort: Desc)])
+  @@index([instructorId, level, updatedAt(sort: Desc)])
+  @@index([instructorId, categoryId, updatedAt(sort: Desc)])
+  @@index([instructorId, status, level, categoryId, updatedAt(sort: Desc)])
+  @@index([status, featured, bestseller])
+  @@index([status, publishedAt])
+  @@index([status, averageRating(sort: Desc)])
+  @@index([language, level])
+  @@index([price, discountPrice])
 }
 
 model QnAQuestion {
@@ -445,6 +568,8 @@ model QnAQuestion {
   @@index([lessonId])
   @@index([isResolved])
   @@index([createdAt])
+  @@index([courseId, isResolved])
+  @@index([studentId, courseId])
 }
 
 model QnAAnswer {
@@ -461,6 +586,7 @@ model QnAAnswer {
   @@index([instructorId])
   @@index([questionId])
   @@index([isAccepted])
+  @@index([createdAt])
 }
 
 model Review {
@@ -491,6 +617,9 @@ model Review {
   @@index([isVerified])
   @@index([helpfulCount])
   @@index([isFlagged])
+  @@index([createdAt])
+  @@index([courseId, rating])
+  @@index([courseId, isVerified])
 }
 
 model ReviewReply {
@@ -513,6 +642,7 @@ model ReviewReply {
   @@index([authorId])
   @@index([parentReplyId])
   @@index([isFlagged])
+  @@index([createdAt])
 }
 
 enum CourseLevel {
@@ -553,6 +683,8 @@ model Category {
   @@index([slug])
   @@index([isActive])
   @@index([order])
+  @@index([name])
+  @@index([isActive, order])
 }
 
 model Section {
@@ -576,6 +708,9 @@ model Section {
   @@unique([courseId, order])
   @@index([courseId])
   @@index([isPublished])
+  @@index([courseId, isPublished])
+  @@index([courseId, order])
+  @@index([courseId, isPublished, order])
 }
 
 model ContentItem {
@@ -597,6 +732,7 @@ model ContentItem {
   @@unique([sectionId, order])
   @@index([sectionId])
   @@index([itemType])
+  @@index([sectionId, order])
 }
 
 enum ContentType {
@@ -622,6 +758,7 @@ model ContentCompletion {
   @@index([studentId])
   @@index([contentItemId])
   @@index([status])
+  @@index([studentId, status])
 }
 
 enum CompletionStatus {
@@ -663,6 +800,7 @@ model Lesson {
   @@index([type])
   @@index([isFree])
   @@index([isPreview])
+  @@index([sectionId, order])
 }
 
 enum LessonType {
@@ -788,6 +926,7 @@ model QuizAttempt {
   @@index([isPassed])
   @@index([status])
   @@index([gradedBy])
+  @@index([studentId, quizId])
 }
 
 enum QuizAttemptStatus {
@@ -846,6 +985,7 @@ model AssignmentSubmission {
   @@index([status])
   @@index([gradedBy])
   @@index([isLate])
+  @@index([studentId, assignmentId])
 }
 
 enum SubmissionStatus {
@@ -893,6 +1033,7 @@ model LessonCompletion {
   @@unique([studentId, lessonId])
   @@index([studentId])
   @@index([lessonId])
+  @@index([completedAt])
 }
 
 model Enrollment {
@@ -924,6 +1065,9 @@ model Enrollment {
   @@index([courseId])
   @@index([paymentId])
   @@index([status])
+  @@index([createdAt])
+  @@index([courseId, status])
+  @@index([studentId, status])
 }
 
 enum EnrollmentStatus {
@@ -956,6 +1100,7 @@ model CourseProgress {
   @@index([enrollmentId])
   @@index([courseId])
   @@index([progressPercentage])
+  @@index([lastActivityAt])
 }
 
 model Payment {
@@ -986,6 +1131,7 @@ model Payment {
   @@index([gateway])
   @@index([transactionId])
   @@index([createdAt])
+  @@index([status, createdAt])
 }
 
 enum PaymentStatus {
@@ -1033,6 +1179,7 @@ model Earning {
   @@index([instructorId])
   @@index([paymentId])
   @@index([status])
+  @@index([createdAt])
 }
 
 enum EarningStatus {
@@ -1063,6 +1210,7 @@ model Certificate {
   @@index([courseId])
   @@index([certificateId])
   @@index([templateId])
+  @@index([issueDate])
 }
 
 model CartItem {
@@ -1078,6 +1226,7 @@ model CartItem {
   @@unique([studentId, courseId])
   @@index([studentId])
   @@index([courseId])
+  @@index([createdAt])
 }
 
 model WishlistItem {
@@ -1092,6 +1241,7 @@ model WishlistItem {
   @@unique([studentId, courseId])
   @@index([studentId])
   @@index([courseId])
+  @@index([createdAt])
 }
 
 model Notification {
@@ -1115,6 +1265,7 @@ model Notification {
   @@index([type])
   @@index([createdAt])
   @@index([priority])
+  @@index([userId, isRead])
 }
 
 enum NotificationType {
@@ -1188,6 +1339,7 @@ model UserActivity {
   @@index([userId])
   @@index([action])
   @@index([createdAt])
+  @@index([userId, createdAt])
 }
 
 model CourseSettings {
@@ -1238,6 +1390,7 @@ model Coupon {
   @@index([isActive])
   @@index([validFrom, validUntil])
   @@index([createdById])
+  @@index([isActive, validFrom, validUntil])
 }
 
 enum CouponType {
@@ -1266,6 +1419,7 @@ model CouponUsage {
   @@index([couponId])
   @@index([paymentId])
   @@index([userId])
+  @@index([createdAt])
 }
 
 model Message {
@@ -1289,6 +1443,7 @@ model Message {
   @@index([isRead])
   @@index([messageType])
   @@index([createdAt])
+  @@index([receiverId, isRead])
 }
 
 enum MessageType {
@@ -1334,6 +1489,7 @@ model Bookmark {
   @@index([userId])
   @@index([courseId])
   @@index([lessonId])
+  @@index([userId, courseId])
 }
 
 model Note {
@@ -1350,6 +1506,7 @@ model Note {
 
   @@index([userId])
   @@index([lessonId])
+  @@index([userId, lessonId])
 }
 
 model StudyPlan {
@@ -1367,6 +1524,7 @@ model StudyPlan {
 
   @@index([studentId])
   @@index([isActive])
+  @@index([studentId, isActive])
 }
 
 model Achievement {
@@ -1386,6 +1544,7 @@ model Achievement {
   @@index([studentId])
   @@index([type])
   @@index([isUnlocked])
+  @@index([studentId, type])
 }
 
 enum AchievementType {
@@ -1411,4 +1570,5 @@ model FAQ {
   @@index([courseId])
   @@index([isActive])
   @@index([order])
+  @@index([courseId, isActive, order])
 }

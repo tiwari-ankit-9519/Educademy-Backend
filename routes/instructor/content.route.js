@@ -22,7 +22,6 @@ import {
   addLessonAttachment,
   updateLessonAttachment,
   deleteLessonAttachment,
-  duplicateSection,
   getContentStats,
   validateCourseContent,
   publishAllSections,
@@ -57,11 +56,6 @@ router.put(
   "/course/:courseId/sections/reorder",
   requireInstructor,
   reorderSections
-);
-router.post(
-  "/section/:sectionId/duplicate",
-  requireInstructor,
-  duplicateSection
 );
 
 router.post("/section/:sectionId/lessons", requireInstructor, createLesson);

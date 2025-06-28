@@ -306,16 +306,30 @@ class RedisService {
     }
   }
 
+  // ✅ ENHANCED: Better null handling for hgetall
   async hgetall(key) {
     try {
       if (!this.isConnected) {
         console.warn("Redis not connected, skipping hgetall operation");
+        return {}; // Return empty object instead of null
+      }
+
+      const result = await this.redis.hgetall(key);
+
+      // Ensure we always return an object, never null
+      if (result === null || result === undefined) {
         return {};
       }
-      return await this.redis.hgetall(key);
+
+      // If result is an empty object or the key doesn't exist, return empty object
+      if (typeof result === "object" && Object.keys(result).length === 0) {
+        return {};
+      }
+
+      return result;
     } catch (error) {
       console.error(`Redis HGETALL error for key ${key}:`, error);
-      return {};
+      return {}; // Return empty object on error instead of null
     }
   }
 
@@ -383,7 +397,8 @@ class RedisService {
         console.warn("Redis not connected, skipping smembers operation");
         return [];
       }
-      return await this.redis.smembers(key);
+      const result = await this.redis.smembers(key);
+      return result || []; // Ensure we always return an array
     } catch (error) {
       console.error(`Redis SMEMBERS error for key ${key}:`, error);
       return [];
@@ -423,7 +438,8 @@ class RedisService {
       if (!this.isConnected) {
         return [];
       }
-      return await this.redis.sunion(...keys);
+      const result = await this.redis.sunion(...keys);
+      return result || [];
     } catch (error) {
       console.error(`Redis SUNION error for keys ${keys.join(", ")}:`, error);
       return [];
@@ -435,7 +451,8 @@ class RedisService {
       if (!this.isConnected) {
         return [];
       }
-      return await this.redis.sinter(...keys);
+      const result = await this.redis.sinter(...keys);
+      return result || [];
     } catch (error) {
       console.error(`Redis SINTER error for keys ${keys.join(", ")}:`, error);
       return [];
@@ -502,7 +519,8 @@ class RedisService {
         console.warn("Redis not connected, skipping lrange operation");
         return [];
       }
-      return await this.redis.lrange(key, start, stop);
+      const result = await this.redis.lrange(key, start, stop);
+      return result || [];
     } catch (error) {
       console.error(`Redis LRANGE error for key ${key}:`, error);
       return [];
@@ -585,7 +603,8 @@ class RedisService {
         console.warn("Redis not connected, skipping zrange operation");
         return [];
       }
-      return await this.redis.zrange(key, start, stop, options);
+      const result = await this.redis.zrange(key, start, stop, options);
+      return result || [];
     } catch (error) {
       console.error(`Redis ZRANGE error for key ${key}:`, error);
       return [];
@@ -598,7 +617,8 @@ class RedisService {
         console.warn("Redis not connected, skipping zrevrange operation");
         return [];
       }
-      return await this.redis.zrevrange(key, start, stop, options);
+      const result = await this.redis.zrevrange(key, start, stop, options);
+      return result || [];
     } catch (error) {
       console.error(`Redis ZREVRANGE error for key ${key}:`, error);
       return [];
@@ -691,7 +711,8 @@ class RedisService {
         console.warn("Redis not connected, skipping keys operation");
         return [];
       }
-      return await this.redis.keys(pattern);
+      const result = await this.redis.keys(pattern);
+      return result || [];
     } catch (error) {
       console.error(`Redis KEYS error for pattern ${pattern}:`, error);
       return [];
@@ -703,7 +724,8 @@ class RedisService {
       if (!this.isConnected) {
         return { cursor: 0, keys: [] };
       }
-      return await this.redis.scan(cursor, options);
+      const result = await this.redis.scan(cursor, options);
+      return result || { cursor: 0, keys: [] };
     } catch (error) {
       console.error(`Redis SCAN error:`, error);
       return { cursor: 0, keys: [] };
@@ -755,7 +777,8 @@ class RedisService {
         console.warn("Redis not connected, skipping mget operation");
         return [];
       }
-      return await this.redis.mget(...keys);
+      const result = await this.redis.mget(...keys);
+      return result || [];
     } catch (error) {
       console.error(`Redis MGET error for keys ${keys.join(", ")}:`, error);
       return [];

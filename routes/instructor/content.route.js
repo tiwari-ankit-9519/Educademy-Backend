@@ -12,10 +12,14 @@ import {
   createQuiz,
   updateQuiz,
   deleteQuiz,
-  addQuizQuestion,
+  addQuizQuestions,
   updateQuizQuestion,
   deleteQuizQuestion,
   reorderQuizQuestions,
+  submitQuizAttempt,
+  getQuizResults,
+  getQuizAttempts,
+  getQuizDetails,
   createAssignment,
   updateAssignment,
   deleteAssignment,
@@ -29,8 +33,14 @@ import {
   importCourseContent,
   previewContent,
   searchCourseContent,
+  getCourseSections,
+  getSectionQuizzes,
+  getSectionLessons,
+  getQuizQuestions,
+  getSingleLesson,
+  getSingleQuiz,
 } from "../../controllers/instructors/content.controller.js";
-import { requireInstructor } from "../../middlewares/middleware.js";
+import { isLoggedIn, requireInstructor } from "../../middlewares/middleware.js";
 
 const router = express.Router();
 
@@ -70,8 +80,10 @@ router.put(
 router.post("/section/:sectionId/quizzes", requireInstructor, createQuiz);
 router.put("/quiz/:quizId", requireInstructor, updateQuiz);
 router.delete("/quiz/:quizId", requireInstructor, deleteQuiz);
+router.get("/quiz/:quizId", isLoggedIn, getQuizDetails); // For Student
+router.get("/quiz/:quizId/attempts", requireInstructor, getQuizAttempts); // For Student
 
-router.post("/quiz/:quizId/questions", requireInstructor, addQuizQuestion);
+router.post("/quiz/:quizId/questions", requireInstructor, addQuizQuestions);
 router.put("/question/:questionId", requireInstructor, updateQuizQuestion);
 router.delete("/question/:questionId", requireInstructor, deleteQuizQuestion);
 router.put(
@@ -79,6 +91,9 @@ router.put(
   requireInstructor,
   reorderQuizQuestions
 );
+
+router.post("/quiz/:quizId/submit", isLoggedIn, submitQuizAttempt); // For Student
+router.get("/quiz/attempt/:attemptId/results", isLoggedIn, getQuizResults); // For Student
 
 router.post(
   "/section/:sectionId/assignments",
@@ -110,5 +125,12 @@ router.post(
   publishAllSections
 );
 router.post("/course/:courseId/import", requireInstructor, importCourseContent);
+
+router.get("/course/:courseId/sections", requireInstructor, getCourseSections);
+router.get("/section/:sectionId/quizzes", requireInstructor, getSectionQuizzes);
+router.get("/section/:sectionId/lessons", requireInstructor, getSectionLessons);
+router.get("/quizzes/:quizId/questions", requireInstructor, getQuizQuestions);
+router.get("/lessons/:lessonId", requireInstructor, getSingleLesson);
+router.get("/quizzes/:quizId", requireInstructor, getSingleQuiz);
 
 export default router;

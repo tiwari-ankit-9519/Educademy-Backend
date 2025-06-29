@@ -7,7 +7,6 @@ import {
   updateCourse,
   submitForReview,
   validateCourse,
-  publishCourse,
   deleteCourse,
   getCourseStats,
   getInstructorDashboard,
@@ -28,6 +27,5 @@ router.delete("/:courseId", deleteCourse);
 router.get("/:courseId/stats", getCourseStats);
 router.post("/:courseId/submit", submitForReview);
 router.get("/:courseId/validate", validateCourse);
-router.post("/:courseId/publish", publishCourse);
 
 export default router;

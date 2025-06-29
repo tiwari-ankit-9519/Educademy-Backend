@@ -4,7 +4,6 @@ import {
   getPendingCourses,
   getCourseReviewDetails,
   reviewCourse,
-  updateCourseStatus,
   getCourseStats,
   bulkCourseActions,
   getCourseReviewHistory,
@@ -19,7 +18,6 @@ router.get("/stats", getCourseStats);
 router.get("/:courseId/review", getCourseReviewDetails);
 router.get("/:courseId/history", getCourseReviewHistory);
 router.post("/:courseId/review", reviewCourse);
-router.put("/:courseId/status", updateCourseStatus);
 router.post("/bulk-actions", bulkCourseActions);
 
 export default router;

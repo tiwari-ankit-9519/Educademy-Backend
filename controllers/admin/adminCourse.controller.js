@@ -663,42 +663,67 @@ export const reviewCourse = asyncHandler(async (req, res) => {
 
   try {
     const { courseId } = req.params;
-    const { action, feedback, qualityNotes, suggestions, priorityFeedback } =
-      req.body;
+    const {
+      action,
+      feedback,
+      qualityNotes,
+      suggestions,
+      priorityFeedback,
+      reason,
+    } = req.body;
     const reviewerId = req.userAuthId;
 
-    if (!["APPROVE", "REJECT"].includes(action)) {
+    const validActions = [
+      "APPROVE",
+      "REJECT",
+      "PUBLISHED",
+      "SUSPENDED",
+      "ARCHIVED",
+      "UNDER_REVIEW",
+    ];
+    if (!validActions.includes(action)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid action. Must be APPROVE or REJECT",
+        message: "Invalid action. Must be one of: " + validActions.join(", "),
         code: "INVALID_ACTION",
       });
     }
 
-    if (action === "REJECT" && !feedback) {
+    if (
+      (action === "REJECT" || action === "SUSPENDED") &&
+      !feedback &&
+      !reason
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Feedback is required when rejecting a course",
+        message: "Feedback or reason is required for this action",
         code: "FEEDBACK_REQUIRED",
       });
     }
 
-    const course = await prisma.course.findUnique({
-      where: { id: courseId },
-      include: {
-        instructor: {
-          include: {
-            user: {
-              select: {
-                firstName: true,
-                lastName: true,
-                email: true,
+    const [course, reviewer] = await Promise.all([
+      prisma.course.findUnique({
+        where: { id: courseId },
+        include: {
+          instructor: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  email: true,
+                },
               },
             },
           },
         },
-      },
-    });
+      }),
+      prisma.user.findUnique({
+        where: { id: reviewerId },
+        select: { firstName: true, lastName: true, email: true },
+      }),
+    ]);
 
     if (!course) {
       return res.status(404).json({
@@ -708,18 +733,24 @@ export const reviewCourse = asyncHandler(async (req, res) => {
       });
     }
 
-    if (course.status !== "UNDER_REVIEW") {
+    if (!reviewer) {
+      return res.status(404).json({
+        success: false,
+        message: "Reviewer not found",
+        code: "REVIEWER_NOT_FOUND",
+      });
+    }
+
+    if (
+      course.status !== "UNDER_REVIEW" &&
+      ["APPROVE", "REJECT"].includes(action)
+    ) {
       return res.status(400).json({
         success: false,
         message: `Cannot review course with status: ${course.status}`,
         code: "INVALID_COURSE_STATUS",
       });
     }
-
-    const reviewer = await prisma.user.findUnique({
-      where: { id: reviewerId },
-      select: { firstName: true, lastName: true, email: true },
-    });
 
     const reviewId = generateReviewId();
     const reviewData = {
@@ -732,115 +763,227 @@ export const reviewCourse = asyncHandler(async (req, res) => {
       reviewerId,
       reviewerName: `${reviewer.firstName} ${reviewer.lastName}`,
       action,
-      feedback: feedback || "",
+      feedback: feedback || reason || "",
       qualityNotes: qualityNotes || "",
       suggestions: suggestions || [],
       priorityFeedback: priorityFeedback || "",
       reviewedAt: new Date().toISOString(),
     };
 
-    const newStatus = action === "APPROVE" ? "PUBLISHED" : "REJECTED";
-    const publishedAt = action === "APPROVE" ? new Date() : null;
+    const statusMap = {
+      APPROVE: "PUBLISHED",
+      REJECT: "REJECTED",
+      PUBLISHED: "PUBLISHED",
+      SUSPENDED: "SUSPENDED",
+      ARCHIVED: "ARCHIVED",
+      UNDER_REVIEW: "UNDER_REVIEW",
+    };
 
-    await prisma.course.update({
+    const newStatus = statusMap[action];
+    const updateData = {
+      status: newStatus,
+      reviewerId,
+      reviewerFeedback: feedback || reason,
+    };
+
+    if (action === "APPROVE" || action === "PUBLISHED") {
+      updateData.publishedAt =
+        course.status !== "PUBLISHED" ? new Date() : course.publishedAt;
+    } else if (action === "REJECT") {
+      updateData.rejectionReason = feedback || reason;
+    } else if (action === "ARCHIVED") {
+      updateData.archivedAt = new Date();
+    }
+
+    const updatedCourse = await prisma.course.update({
       where: { id: courseId },
-      data: {
-        status: newStatus,
-        publishedAt,
-        reviewerId,
-        reviewerFeedback: feedback,
-        rejectionReason: action === "REJECT" ? feedback : null,
-      },
+      data: updateData,
     });
 
-    if (action === "APPROVE") {
+    if (
+      (action === "APPROVE" || action === "PUBLISHED") &&
+      course.status !== "PUBLISHED"
+    ) {
       await prisma.instructor.update({
         where: { id: course.instructorId },
-        data: {
-          totalCourses: {
-            increment: 1,
-          },
-        },
+        data: { totalCourses: { increment: 1 } },
       });
     }
 
-    const reviewHistoryKey = `course_review_history:${courseId}`;
-    const existingHistory =
-      (await redisService.getJSON(reviewHistoryKey)) || [];
-    existingHistory.push(reviewData);
-    await redisService.setJSON(reviewHistoryKey, existingHistory, {
-      ex: 30 * 24 * 60 * 60,
-    });
+    setImmediate(async () => {
+      try {
+        await Promise.all([
+          redisService.setJSON(
+            `course_review_history:${courseId}`,
+            [
+              ...((await redisService.getJSON(
+                `course_review_history:${courseId}`
+              )) || []),
+              reviewData,
+            ],
+            { ex: 30 * 24 * 60 * 60 }
+          ),
+          redisService.setJSON(
+            `course_status_changes:${courseId}`,
+            [
+              ...((await redisService.getJSON(
+                `course_status_changes:${courseId}`
+              )) || []),
+              {
+                previousStatus: course.status,
+                newStatus,
+                reason: feedback || reason || "",
+                changedBy: reviewerId,
+                changedAt: new Date().toISOString(),
+              },
+            ],
+            { ex: 30 * 24 * 60 * 60 }
+          ),
+          redisService.incrby("admin_course_review_stats", "total_reviews", 1),
+          redisService.incrby(
+            "admin_course_review_stats",
+            ["APPROVE", "PUBLISHED"].includes(action)
+              ? "approved_courses"
+              : "rejected_courses",
+            1
+          ),
+        ]);
 
-    const statsKey = "admin_course_review_stats";
-    await redisService.hincrby(statsKey, "total_reviews", 1);
-    await redisService.hincrby(
-      statsKey,
-      action === "APPROVE" ? "approved_courses" : "rejected_courses",
-      1
-    );
+        const notifications = [];
+        const emails = [];
 
-    try {
-      if (action === "APPROVE") {
-        await emailService.sendCourseApprovalEmail({
-          email: course.instructor.user.email,
-          firstName: course.instructor.user.firstName,
-          courseTitle: course.title,
-          courseId: course.id,
-          feedback:
-            feedback ||
-            "Your course meets our quality standards and has been approved for publication.",
-          courseUrl: `${process.env.FRONTEND_URL}/courses/${course.slug}`,
-        });
+        if (action === "APPROVE" || action === "PUBLISHED") {
+          notifications.push(
+            notificationService.createNotification({
+              userId: course.instructor.user.id,
+              type: "COURSE_PUBLISHED",
+              title: "Course Approved! 🎉",
+              message: `Your course "${course.title}" has been approved and is now live.`,
+              priority: "HIGH",
+              data: {
+                courseId: course.id,
+                courseName: course.title,
+                courseUrl: `${process.env.FRONTEND_URL}/courses/${course.slug}`,
+                feedback: feedback || "",
+              },
+              actionUrl: `/instructor/courses/${course.id}`,
+            })
+          );
 
-        await notificationService.createNotification({
-          userId: course.instructor.user.id,
-          type: "course_approved",
-          title: "Course Approved! 🎉",
-          message: `Your course "${course.title}" has been approved and is now live.`,
-          priority: "HIGH",
-          data: {
-            courseId: course.id,
-            courseName: course.title,
-            courseUrl: `${process.env.FRONTEND_URL}/courses/${course.slug}`,
-            feedback,
-          },
-          actionUrl: `/instructor/courses/${course.id}`,
-        });
-      } else {
-        await emailService.sendCourseRejectionEmail({
-          email: course.instructor.user.email,
-          firstName: course.instructor.user.firstName,
-          courseTitle: course.title,
-          courseId: course.id,
-          rejectionReason: feedback,
-          feedback: qualityNotes,
-        });
+          emails.push(
+            emailService.sendCourseApprovalEmail({
+              email: course.instructor.user.email,
+              firstName: course.instructor.user.firstName,
+              courseTitle: course.title,
+              courseId: course.id,
+              feedback:
+                feedback ||
+                "Your course meets our quality standards and has been approved for publication.",
+              courseUrl: `${process.env.FRONTEND_URL}/courses/${course.slug}`,
+            })
+          );
+        } else if (action === "REJECT") {
+          notifications.push(
+            notificationService.createNotification({
+              userId: course.instructor.user.id,
+              type: "COURSE_UPDATED",
+              title: "Course Review Required",
+              message: `Your course "${course.title}" needs updates before publication.`,
+              priority: "NORMAL",
+              data: {
+                courseId: course.id,
+                courseName: course.title,
+                feedback: feedback || "",
+                suggestions: suggestions || [],
+                rejectionReason: feedback || "",
+              },
+              actionUrl: `/instructor/courses/${course.id}/edit`,
+            })
+          );
 
-        await notificationService.createNotification({
-          userId: course.instructor.user.id,
-          type: "course_rejected",
-          title: "Course Review Required",
-          message: `Your course "${course.title}" needs updates before publication.`,
-          priority: "NORMAL",
-          data: {
-            courseId: course.id,
-            courseName: course.title,
-            feedback,
-            suggestions: suggestions || [],
-            rejectionReason: feedback,
-          },
-          actionUrl: `/instructor/courses/${course.id}/edit`,
-        });
+          emails.push(
+            emailService.sendCourseRejectionEmail({
+              email: course.instructor.user.email,
+              firstName: course.instructor.user.firstName,
+              courseTitle: course.title,
+              courseId: course.id,
+              rejectionReason: feedback || "",
+              feedback: qualityNotes || "",
+            })
+          );
+        } else {
+          const statusMessages = {
+            SUSPENDED: {
+              title: "Course Suspended",
+              message: `Your course "${course.title}" has been temporarily suspended.`,
+              subject: "Course Suspended - Action Required",
+            },
+            ARCHIVED: {
+              title: "Course Archived",
+              message: `Your course "${course.title}" has been archived.`,
+              subject: "Course Archived - Educademy",
+            },
+            UNDER_REVIEW: {
+              title: "Course Under Review",
+              message: `Your course "${course.title}" is being reviewed by our team.`,
+              subject: "Course Under Review - Educademy",
+            },
+          };
+
+          const statusData = statusMessages[action];
+          if (statusData) {
+            notifications.push(
+              notificationService.createNotification({
+                userId: course.instructor.user.id,
+                type: "SYSTEM_ANNOUNCEMENT",
+                title: statusData.title,
+                message: statusData.message,
+                priority: action === "SUSPENDED" ? "HIGH" : "NORMAL",
+                data: {
+                  courseId: course.id,
+                  courseName: course.title,
+                  previousStatus: course.status,
+                  newStatus,
+                  reason: reason || "",
+                },
+                actionUrl: `/instructor/courses/${course.id}`,
+              })
+            );
+
+            emails.push(
+              emailService.send({
+                to: course.instructor.user.email,
+                subject: statusData.subject,
+                template: "course",
+                templateData: {
+                  userName: course.instructor.user.firstName,
+                  title: statusData.title,
+                  subtitle: `Your course status has been updated to ${newStatus.toLowerCase()}`,
+                  message:
+                    statusData.message + (reason ? ` Reason: ${reason}` : ""),
+                  courseType: newStatus.toLowerCase(),
+                  courseName: course.title,
+                  actionButton: "View Course",
+                  actionUrl: `${process.env.FRONTEND_URL}/instructor/courses/${course.id}`,
+                },
+              })
+            );
+          }
+        }
+
+        await Promise.all([...notifications, ...emails]);
+
+        await Promise.all([
+          redisService.delPattern("admin_pending_courses:*"),
+          redisService.del(`admin_course_review:${courseId}`),
+          redisService.del(`course_details:${courseId}`),
+          redisService.del(`instructor_courses:${course.instructorId}`),
+          redisService.delPattern(`courses:*`),
+        ]);
+      } catch (error) {
+        console.error("Background operations failed:", error);
       }
-    } catch (emailError) {
-      console.error("Failed to send course review email:", emailError);
-    }
-
-    await redisService.delPattern("admin_pending_courses:*");
-    await redisService.del(`admin_course_review:${courseId}`);
-    await redisService.del(`course_details:${courseId}`);
-    await redisService.del(`instructor_courses:${course.instructorId}`);
+    });
 
     const executionTime = Math.round(performance.now() - startTime);
 
@@ -854,7 +997,8 @@ export const reviewCourse = asyncHandler(async (req, res) => {
         action,
         newStatus,
         reviewedAt: reviewData.reviewedAt,
-        publishedAt,
+        publishedAt: updatedCourse.publishedAt,
+        feedback: feedback || reason,
       },
       meta: {
         executionTime,
@@ -866,189 +1010,6 @@ export const reviewCourse = asyncHandler(async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to review course",
-      code: "INTERNAL_SERVER_ERROR",
-      meta: {
-        executionTime: Math.round(performance.now() - startTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
-export const updateCourseStatus = asyncHandler(async (req, res) => {
-  const startTime = performance.now();
-
-  try {
-    const { courseId } = req.params;
-    const { status, reason } = req.body;
-    const adminId = req.userAuthId;
-
-    const validStatuses = [
-      "PUBLISHED",
-      "SUSPENDED",
-      "ARCHIVED",
-      "UNDER_REVIEW",
-    ];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid status. Must be one of: " + validStatuses.join(", "),
-        code: "INVALID_STATUS",
-      });
-    }
-
-    const course = await prisma.course.findUnique({
-      where: { id: courseId },
-      include: {
-        instructor: {
-          include: {
-            user: {
-              select: {
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
-            },
-          },
-        },
-      },
-    });
-
-    if (!course) {
-      return res.status(404).json({
-        success: false,
-        message: "Course not found",
-        code: "COURSE_NOT_FOUND",
-      });
-    }
-
-    const updateData = {
-      status,
-      reviewerId: adminId,
-    };
-
-    if (status === "PUBLISHED" && course.status !== "PUBLISHED") {
-      updateData.publishedAt = new Date();
-    } else if (status === "ARCHIVED") {
-      updateData.archivedAt = new Date();
-    }
-
-    if (reason) {
-      updateData.reviewerFeedback = reason;
-    }
-
-    await prisma.course.update({
-      where: { id: courseId },
-      data: updateData,
-    });
-
-    const statusChangeKey = `course_status_changes:${courseId}`;
-    const statusHistory = (await redisService.getJSON(statusChangeKey)) || [];
-    statusHistory.push({
-      previousStatus: course.status,
-      newStatus: status,
-      reason: reason || "",
-      changedBy: adminId,
-      changedAt: new Date().toISOString(),
-    });
-    await redisService.setJSON(statusChangeKey, statusHistory, {
-      ex: 30 * 24 * 60 * 60,
-    });
-
-    try {
-      let notificationTitle = "";
-      let notificationMessage = "";
-      let emailSubject = "";
-
-      switch (status) {
-        case "SUSPENDED":
-          notificationTitle = "Course Suspended";
-          notificationMessage = `Your course "${course.title}" has been temporarily suspended.`;
-          emailSubject = "Course Suspended - Action Required";
-          break;
-        case "ARCHIVED":
-          notificationTitle = "Course Archived";
-          notificationMessage = `Your course "${course.title}" has been archived.`;
-          emailSubject = "Course Archived - Educademy";
-          break;
-        case "PUBLISHED":
-          notificationTitle = "Course Published";
-          notificationMessage = `Your course "${course.title}" is now published and available to students.`;
-          emailSubject = "Course Published - Congratulations!";
-          break;
-        case "UNDER_REVIEW":
-          notificationTitle = "Course Under Review";
-          notificationMessage = `Your course "${course.title}" is being reviewed by our team.`;
-          emailSubject = "Course Under Review - Educademy";
-          break;
-      }
-
-      await notificationService.createNotification({
-        userId: course.instructor.user.id,
-        type: "course_status_update",
-        title: notificationTitle,
-        message: notificationMessage,
-        priority: status === "SUSPENDED" ? "HIGH" : "NORMAL",
-        data: {
-          courseId: course.id,
-          courseName: course.title,
-          previousStatus: course.status,
-          newStatus: status,
-          reason,
-        },
-        actionUrl: `/instructor/courses/${course.id}`,
-      });
-
-      await emailService.send({
-        to: course.instructor.user.email,
-        subject: emailSubject,
-        template: "course",
-        templateData: {
-          userName: course.instructor.user.firstName,
-          title: notificationTitle,
-          subtitle: `Your course status has been updated to ${status.toLowerCase()}`,
-          message: notificationMessage + (reason ? ` Reason: ${reason}` : ""),
-          courseType: status.toLowerCase(),
-          courseName: course.title,
-          actionButton: "View Course",
-          actionUrl: `${process.env.FRONTEND_URL}/instructor/courses/${course.id}`,
-        },
-      });
-    } catch (notificationError) {
-      console.error(
-        "Failed to send status update notification:",
-        notificationError
-      );
-    }
-
-    await redisService.delPattern("admin_pending_courses:*");
-    await redisService.del(`admin_course_review:${courseId}`);
-    await redisService.del(`course_details:${courseId}`);
-    await redisService.del(`instructor_courses:${course.instructorId}`);
-
-    const executionTime = Math.round(performance.now() - startTime);
-
-    res.status(200).json({
-      success: true,
-      message: "Course status updated successfully",
-      data: {
-        courseId,
-        courseName: course.title,
-        previousStatus: course.status,
-        newStatus: status,
-        reason,
-        updatedAt: new Date().toISOString(),
-      },
-      meta: {
-        executionTime,
-        timestamp: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error("Update course status error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to update course status",
       code: "INTERNAL_SERVER_ERROR",
       meta: {
         executionTime: Math.round(performance.now() - startTime),
@@ -1112,24 +1073,58 @@ export const getCourseStats = asyncHandler(async (req, res) => {
       recentSubmissions,
       reviewStats,
     ] = await Promise.all([
-      prisma.course.count(),
-      prisma.course.count({ where: { status: "PUBLISHED" } }),
-      prisma.course.count({ where: { status: "UNDER_REVIEW" } }),
-      prisma.course.count({ where: { status: "REJECTED" } }),
-      prisma.course.count({ where: { status: "SUSPENDED" } }),
+      prisma.course.count({
+        where: {
+          status: { not: "ARCHIVED" },
+        },
+      }),
+      prisma.course.count({
+        where: {
+          status: "PUBLISHED",
+          archivedAt: null,
+        },
+      }),
+      prisma.course.count({
+        where: {
+          status: "UNDER_REVIEW",
+          archivedAt: null,
+        },
+      }),
+      prisma.course.count({
+        where: {
+          status: "REJECTED",
+          archivedAt: null,
+        },
+      }),
+      prisma.course.count({
+        where: {
+          status: "SUSPENDED",
+          archivedAt: null,
+        },
+      }),
       prisma.course.groupBy({
         by: ["categoryId"],
+        where: {
+          status: { not: "ARCHIVED" },
+          archivedAt: null,
+        },
         _count: { categoryId: true },
         orderBy: { _count: { categoryId: "desc" } },
         take: 10,
       }),
       prisma.course.groupBy({
         by: ["level"],
+        where: {
+          status: { not: "ARCHIVED" },
+          archivedAt: null,
+        },
         _count: { level: true },
       }),
       prisma.course.count({
         where: {
           reviewSubmittedAt: dateFilter,
+          status: { not: "ARCHIVED" },
+          archivedAt: null,
         },
       }),
       redisService.hgetall("admin_course_review_stats"),
@@ -1150,7 +1145,7 @@ export const getCourseStats = asyncHandler(async (req, res) => {
       where: {
         status: { in: ["PUBLISHED", "REJECTED"] },
         reviewSubmittedAt: { not: null },
-        updatedAt: { not: null },
+        archivedAt: null,
       },
       select: {
         reviewSubmittedAt: true,
@@ -1159,11 +1154,16 @@ export const getCourseStats = asyncHandler(async (req, res) => {
       take: 100,
     });
 
-    const reviewTimes = avgReviewTime.map((course) => {
-      const submitted = new Date(course.reviewSubmittedAt);
-      const reviewed = new Date(course.updatedAt);
-      return (reviewed.getTime() - submitted.getTime()) / (1000 * 60 * 60 * 24);
-    });
+    const reviewTimes = avgReviewTime
+      .filter((course) => course.reviewSubmittedAt && course.updatedAt)
+      .map((course) => {
+        const submitted = new Date(course.reviewSubmittedAt);
+        const reviewed = new Date(course.updatedAt);
+        return (
+          (reviewed.getTime() - submitted.getTime()) / (1000 * 60 * 60 * 24)
+        );
+      })
+      .filter((time) => time > 0);
 
     const averageReviewDays =
       reviewTimes.length > 0
@@ -1173,7 +1173,10 @@ export const getCourseStats = asyncHandler(async (req, res) => {
         : 0;
 
     const qualityScore = await prisma.course.findMany({
-      where: { status: "PUBLISHED" },
+      where: {
+        status: "PUBLISHED",
+        archivedAt: null,
+      },
       select: {
         averageRating: true,
         totalRatings: true,
@@ -1189,6 +1192,8 @@ export const getCourseStats = asyncHandler(async (req, res) => {
             ) / qualityScore.length
           ).toFixed(1)
         : 0;
+
+    const safeReviewStats = reviewStats || {};
 
     const stats = {
       overview: {
@@ -1226,9 +1231,9 @@ export const getCourseStats = asyncHandler(async (req, res) => {
         count: level._count.level,
       })),
       reviewMetrics: {
-        totalReviews: parseInt(reviewStats?.total_reviews || 0),
-        approvedReviews: parseInt(reviewStats?.approved_courses || 0),
-        rejectedReviews: parseInt(reviewStats?.rejected_courses || 0),
+        totalReviews: parseInt(safeReviewStats.total_reviews || 0),
+        approvedReviews: parseInt(safeReviewStats.approved_courses || 0),
+        rejectedReviews: parseInt(safeReviewStats.rejected_courses || 0),
         averageReviewTime: `${averageReviewDays} days`,
         pendingReviews: pendingCourses,
         recentSubmissions,
@@ -1255,7 +1260,13 @@ export const getCourseStats = asyncHandler(async (req, res) => {
       },
     };
 
-    await redisService.setJSON(cacheKey, stats, { ex: 1800 });
+    setImmediate(async () => {
+      try {
+        await redisService.setJSON(cacheKey, stats, { ex: 1800 });
+      } catch (cacheError) {
+        console.warn("Failed to cache course stats:", cacheError);
+      }
+    });
 
     const executionTime = Math.round(performance.now() - startTime);
 
@@ -1473,11 +1484,11 @@ export const bulkCourseActions = asyncHandler(async (req, res) => {
     );
 
     const statsKey = "admin_course_review_stats";
-    await redisService.hincrby(statsKey, "total_reviews", results.length);
+    await redisService.incrby(statsKey, "total_reviews", results.length);
     if (action === "APPROVE") {
-      await redisService.hincrby(statsKey, "approved_courses", results.length);
+      await redisService.incrby(statsKey, "approved_courses", results.length);
     } else if (action === "REJECT") {
-      await redisService.hincrby(statsKey, "rejected_courses", results.length);
+      await redisService.incrby(statsKey, "rejected_courses", results.length);
     }
 
     await redisService.delPattern("admin_pending_courses:*");

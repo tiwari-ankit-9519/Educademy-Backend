@@ -14,7 +14,6 @@ export const addToCart = asyncHandler(async (req, res) => {
 
   try {
     const { courseId } = req.body;
-    const studentId = req.userAuthId;
 
     if (!courseId) {
       return res.status(400).json({
@@ -63,7 +62,7 @@ export const addToCart = asyncHandler(async (req, res) => {
       });
     }
 
-    if (course.instructorId === studentId) {
+    if (course.instructorId === req.userAuthId) {
       return res.status(400).json({
         success: false,
         message: "You cannot purchase your own course",
@@ -74,7 +73,7 @@ export const addToCart = asyncHandler(async (req, res) => {
     const existingEnrollment = await prisma.enrollment.findUnique({
       where: {
         studentId_courseId: {
-          studentId: studentId,
+          studentId: req.userAuthId,
           courseId: courseId,
         },
       },
@@ -91,7 +90,7 @@ export const addToCart = asyncHandler(async (req, res) => {
     const existingCartItem = await prisma.cartItem.findUnique({
       where: {
         studentId_courseId: {
-          studentId: studentId,
+          studentId: req.userAuthId,
           courseId: courseId,
         },
       },
@@ -107,7 +106,7 @@ export const addToCart = asyncHandler(async (req, res) => {
 
     const cartItem = await prisma.cartItem.create({
       data: {
-        studentId: studentId,
+        studentId: req.userAuthId,
         courseId: courseId,
         price: course.discountPrice || course.price,
       },
@@ -137,9 +136,9 @@ export const addToCart = asyncHandler(async (req, res) => {
       },
     });
 
-    const cacheKey = `cart:${studentId}`;
+    const cacheKey = `cart:${req.userAuthId}`;
     await redisService.del(cacheKey);
-    await redisService.del(`cart_totals:${studentId}`);
+    await redisService.del(`cart_totals:${req.userAuthId}`);
 
     const executionTime = performance.now() - startTime;
 
@@ -201,7 +200,6 @@ export const removeFromCart = asyncHandler(async (req, res) => {
 
   try {
     const { courseId } = req.params;
-    const studentId = req.userAuthId;
 
     if (!courseId) {
       return res.status(400).json({
@@ -214,7 +212,7 @@ export const removeFromCart = asyncHandler(async (req, res) => {
     const cartItem = await prisma.cartItem.findUnique({
       where: {
         studentId_courseId: {
-          studentId: studentId,
+          studentId: req.userAuthId,
           courseId: courseId,
         },
       },
@@ -238,15 +236,15 @@ export const removeFromCart = asyncHandler(async (req, res) => {
     await prisma.cartItem.delete({
       where: {
         studentId_courseId: {
-          studentId: studentId,
+          studentId: req.userAuthId,
           courseId: courseId,
         },
       },
     });
 
-    const cacheKey = `cart:${studentId}`;
+    const cacheKey = `cart:${req.userAuthId}`;
     await redisService.del(cacheKey);
-    await redisService.del(`cart_totals:${studentId}`);
+    await redisService.del(`cart_totals:${req.userAuthId}`);
 
     const executionTime = performance.now() - startTime;
 
@@ -293,14 +291,13 @@ export const getCart = asyncHandler(async (req, res) => {
   const startTime = performance.now();
 
   try {
-    const studentId = req.userAuthId;
-    const cacheKey = `cart:${studentId}`;
+    const cacheKey = `cart:${req.userAuthId}`;
 
     let cartItems = await redisService.getJSON(cacheKey);
 
     if (!cartItems) {
       cartItems = await prisma.cartItem.findMany({
-        where: { studentId: studentId },
+        where: { studentId: req.userAuthId },
         include: {
           course: {
             select: {
@@ -410,15 +407,13 @@ export const clearCart = asyncHandler(async (req, res) => {
   const startTime = performance.now();
 
   try {
-    const studentId = req.userAuthId;
-
     const deletedItems = await prisma.cartItem.deleteMany({
-      where: { studentId: studentId },
+      where: { studentId: req.userAuthId },
     });
 
-    const cacheKey = `cart:${studentId}`;
+    const cacheKey = `cart:${req.userAuthId}`;
     await redisService.del(cacheKey);
-    await redisService.del(`cart_totals:${studentId}`);
+    await redisService.del(`cart_totals:${req.userAuthId}`);
 
     const executionTime = performance.now() - startTime;
 
@@ -551,7 +546,6 @@ export const applyCoupon = asyncHandler(async (req, res) => {
 
   try {
     const { couponCode } = req.body;
-    const studentId = req.userAuthId;
 
     if (!couponCode) {
       return res.status(400).json({
@@ -562,7 +556,7 @@ export const applyCoupon = asyncHandler(async (req, res) => {
     }
 
     const cartItems = await prisma.cartItem.findMany({
-      where: { studentId: studentId },
+      where: { studentId: req.userAuthId },
       include: {
         course: {
           select: {
@@ -593,7 +587,7 @@ export const applyCoupon = asyncHandler(async (req, res) => {
 
     const validation = await validateCoupon(
       couponCode.toUpperCase(),
-      studentId,
+      req.userAuthId,
       cartTotal,
       courseIds
     );
@@ -644,7 +638,7 @@ export const applyCoupon = asyncHandler(async (req, res) => {
       applicableCourseTotal
     );
 
-    const sessionKey = `cart_coupon:${studentId}`;
+    const sessionKey = `cart_coupon:${req.userAuthId}`;
     const couponSession = {
       couponId: coupon.id,
       code: coupon.code,
@@ -661,7 +655,7 @@ export const applyCoupon = asyncHandler(async (req, res) => {
 
     await redisService.setJSON(sessionKey, couponSession, { ex: 3600 });
 
-    await redisService.del(`cart_totals:${studentId}`);
+    await redisService.del(`cart_totals:${req.userAuthId}`);
 
     const finalTotal = Math.max(0, cartTotal - discountAmount);
     const savings = discountAmount;
@@ -721,8 +715,7 @@ export const removeCoupon = asyncHandler(async (req, res) => {
   const startTime = performance.now();
 
   try {
-    const studentId = req.userAuthId;
-    const sessionKey = `cart_coupon:${studentId}`;
+    const sessionKey = `cart_coupon:${req.userAuthId}`;
 
     const existingCoupon = await redisService.getJSON(sessionKey);
 
@@ -735,10 +728,10 @@ export const removeCoupon = asyncHandler(async (req, res) => {
     }
 
     await redisService.del(sessionKey);
-    await redisService.del(`cart_totals:${studentId}`);
+    await redisService.del(`cart_totals:${req.userAuthId}`);
 
     const cartItems = await prisma.cartItem.findMany({
-      where: { studentId: studentId },
+      where: { studentId: req.userAuthId },
     });
 
     const subtotal = cartItems.reduce(
@@ -797,7 +790,6 @@ export const validateCartCoupon = asyncHandler(async (req, res) => {
 
   try {
     const { couponCode } = req.query;
-    const studentId = req.userAuthId;
 
     if (!couponCode) {
       return res.status(400).json({
@@ -808,7 +800,7 @@ export const validateCartCoupon = asyncHandler(async (req, res) => {
     }
 
     const cartItems = await prisma.cartItem.findMany({
-      where: { studentId: studentId },
+      where: { studentId: req.userAuthId },
       include: {
         course: {
           select: {
@@ -837,7 +829,7 @@ export const validateCartCoupon = asyncHandler(async (req, res) => {
 
     const validation = await validateCoupon(
       couponCode.toUpperCase(),
-      studentId,
+      req.userAuthId,
       cartTotal,
       courseIds
     );
@@ -931,14 +923,13 @@ export const getCartTotals = asyncHandler(async (req, res) => {
   const startTime = performance.now();
 
   try {
-    const studentId = req.userAuthId;
-    const cacheKey = `cart_totals:${studentId}`;
+    const cacheKey = `cart_totals:${req.userAuthId}`;
 
     let totals = await redisService.getJSON(cacheKey);
 
     if (!totals) {
       const cartItems = await prisma.cartItem.findMany({
-        where: { studentId: studentId },
+        where: { studentId: req.userAuthId },
         include: {
           course: {
             select: {
@@ -956,7 +947,7 @@ export const getCartTotals = asyncHandler(async (req, res) => {
         0
       );
 
-      const sessionKey = `cart_coupon:${studentId}`;
+      const sessionKey = `cart_coupon:${req.userAuthId}`;
       const appliedCoupon = await redisService.getJSON(sessionKey);
 
       let discount = 0;
@@ -1039,10 +1030,8 @@ export const syncCart = asyncHandler(async (req, res) => {
   const startTime = performance.now();
 
   try {
-    const studentId = req.userAuthId;
-
     const cartItems = await prisma.cartItem.findMany({
-      where: { studentId: studentId },
+      where: { studentId: req.userAuthId },
       include: {
         course: {
           select: {
@@ -1086,7 +1075,7 @@ export const syncCart = asyncHandler(async (req, res) => {
 
     const existingEnrollments = await prisma.enrollment.findMany({
       where: {
-        studentId: studentId,
+        studentId: req.userAuthId,
         courseId: {
           in: cartItems.map((item) => item.course.id),
         },
@@ -1097,7 +1086,7 @@ export const syncCart = asyncHandler(async (req, res) => {
     for (const enrollment of existingEnrollments) {
       await prisma.cartItem.deleteMany({
         where: {
-          studentId: studentId,
+          studentId: req.userAuthId,
           courseId: enrollment.courseId,
         },
       });
@@ -1107,8 +1096,8 @@ export const syncCart = asyncHandler(async (req, res) => {
       });
     }
 
-    await redisService.del(`cart:${studentId}`);
-    await redisService.del(`cart_totals:${studentId}`);
+    await redisService.del(`cart:${req.userAuthId}`);
+    await redisService.del(`cart_totals:${req.userAuthId}`);
 
     const executionTime = performance.now() - startTime;
 
@@ -1156,7 +1145,6 @@ export const moveToWishlist = asyncHandler(async (req, res) => {
 
   try {
     const { courseId } = req.body;
-    const studentId = req.userAuthId;
 
     if (!courseId) {
       return res.status(400).json({
@@ -1169,7 +1157,7 @@ export const moveToWishlist = asyncHandler(async (req, res) => {
     const cartItem = await prisma.cartItem.findUnique({
       where: {
         studentId_courseId: {
-          studentId: studentId,
+          studentId: req.userAuthId,
           courseId: courseId,
         },
       },
@@ -1203,7 +1191,7 @@ export const moveToWishlist = asyncHandler(async (req, res) => {
     const existingWishlistItem = await prisma.wishlistItem.findUnique({
       where: {
         studentId_courseId: {
-          studentId: studentId,
+          studentId: req.userAuthId,
           courseId: courseId,
         },
       },
@@ -1212,7 +1200,7 @@ export const moveToWishlist = asyncHandler(async (req, res) => {
     if (!existingWishlistItem) {
       await prisma.wishlistItem.create({
         data: {
-          studentId: studentId,
+          studentId: req.userAuthId,
           courseId: courseId,
         },
       });
@@ -1221,15 +1209,15 @@ export const moveToWishlist = asyncHandler(async (req, res) => {
     await prisma.cartItem.delete({
       where: {
         studentId_courseId: {
-          studentId: studentId,
+          studentId: req.userAuthId,
           courseId: courseId,
         },
       },
     });
 
-    await redisService.del(`cart:${studentId}`);
-    await redisService.del(`cart_totals:${studentId}`);
-    await redisService.del(`wishlist:${studentId}`);
+    await redisService.del(`cart:${req.userAuthId}`);
+    await redisService.del(`cart_totals:${req.userAuthId}`);
+    await redisService.del(`wishlist:${req.userAuthId}`);
 
     const executionTime = performance.now() - startTime;
 
@@ -1277,11 +1265,9 @@ export const getCartSummary = asyncHandler(async (req, res) => {
   const startTime = performance.now();
 
   try {
-    const studentId = req.userAuthId;
-
     const [cartItems, appliedCoupon] = await Promise.all([
       prisma.cartItem.findMany({
-        where: { studentId: studentId },
+        where: { studentId: req.userAuthId },
         include: {
           course: {
             select: {
@@ -1296,7 +1282,7 @@ export const getCartSummary = asyncHandler(async (req, res) => {
           },
         },
       }),
-      redisService.getJSON(`cart_coupon:${studentId}`),
+      redisService.getJSON(`cart_coupon:${req.userAuthId}`),
     ]);
 
     const subtotal = cartItems.reduce(
@@ -1370,7 +1356,6 @@ export const bulkAddToCart = asyncHandler(async (req, res) => {
 
   try {
     const { courseIds } = req.body;
-    const studentId = req.userAuthId;
 
     if (!courseIds || !Array.isArray(courseIds) || courseIds.length === 0) {
       return res.status(400).json({
@@ -1392,7 +1377,7 @@ export const bulkAddToCart = asyncHandler(async (req, res) => {
       where: {
         id: { in: courseIds },
         status: "PUBLISHED",
-        instructorId: { not: studentId },
+        instructorId: { not: req.userAuthId },
       },
       select: {
         id: true,
@@ -1405,7 +1390,7 @@ export const bulkAddToCart = asyncHandler(async (req, res) => {
 
     const existingEnrollments = await prisma.enrollment.findMany({
       where: {
-        studentId: studentId,
+        studentId: req.userAuthId,
         courseId: { in: courseIds },
       },
       select: { courseId: true },
@@ -1413,7 +1398,7 @@ export const bulkAddToCart = asyncHandler(async (req, res) => {
 
     const existingCartItems = await prisma.cartItem.findMany({
       where: {
-        studentId: studentId,
+        studentId: req.userAuthId,
         courseId: { in: courseIds },
       },
       select: { courseId: true },
@@ -1457,7 +1442,7 @@ export const bulkAddToCart = asyncHandler(async (req, res) => {
       try {
         await prisma.cartItem.create({
           data: {
-            studentId: studentId,
+            studentId: req.userAuthId,
             courseId: courseId,
             price: course.discountPrice || course.price,
           },
@@ -1477,8 +1462,8 @@ export const bulkAddToCart = asyncHandler(async (req, res) => {
       }
     }
 
-    await redisService.del(`cart:${studentId}`);
-    await redisService.del(`cart_totals:${studentId}`);
+    await redisService.del(`cart:${req.userAuthId}`);
+    await redisService.del(`cart_totals:${req.userAuthId}`);
 
     const executionTime = performance.now() - startTime;
 

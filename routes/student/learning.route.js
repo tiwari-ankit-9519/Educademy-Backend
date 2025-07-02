@@ -14,11 +14,11 @@ import {
   deleteNote,
   deleteBookmark,
 } from "../../controllers/student/learning.controller.js";
-import { isLoggedIn } from "../../middlewares/middleware.js";
+import { requireStudent } from "../../middlewares/middleware.js";
 
 const router = express.Router();
 
-router.use(isLoggedIn);
+router.use(requireStudent);
 
 router.get("/courses", getEnrolledCourses);
 router.get("/courses/:courseId/content", getCourseContent);

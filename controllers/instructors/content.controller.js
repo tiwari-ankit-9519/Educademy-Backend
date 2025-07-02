@@ -2,6 +2,7 @@ import { PrismaClient } from "@prisma/client";
 import asyncHandler from "express-async-handler";
 import redisService from "../../utils/redis.js";
 import { v2 as cloudinary } from "cloudinary";
+import { deleteFromCloudinary } from "../../config/upload.js";
 
 const prisma = new PrismaClient();
 
@@ -2491,6 +2492,27 @@ export const createAssignment = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();
   const startTime = performance.now();
 
+  const cleanupUploadedFiles = async () => {
+    if (req.files?.length > 0) {
+      const cleanupPromises = req.files.map(async (file) => {
+        try {
+          if (file.filename) {
+            let resourceType = "raw";
+            if (file.mimetype?.startsWith("image/")) {
+              resourceType = "image";
+            } else if (file.mimetype?.startsWith("video/")) {
+              resourceType = "video";
+            }
+            await deleteFromCloudinary(file.filename, resourceType);
+          }
+        } catch (error) {
+          console.error(`Failed to cleanup file ${file.filename}:`, error);
+        }
+      });
+      await Promise.allSettled(cleanupPromises);
+    }
+  };
+
   try {
     const { sectionId } = req.params;
     const {
@@ -2499,7 +2521,6 @@ export const createAssignment = asyncHandler(async (req, res) => {
       instructions,
       dueDate,
       totalPoints,
-      resources,
       rubric,
       allowLateSubmission = false,
       latePenalty,
@@ -2507,6 +2528,7 @@ export const createAssignment = asyncHandler(async (req, res) => {
     const instructorId = req.instructorProfile.id;
 
     if (!title || !description || !instructions || !totalPoints) {
+      await cleanupUploadedFiles();
       return res.status(400).json({
         success: false,
         message:
@@ -2515,12 +2537,39 @@ export const createAssignment = asyncHandler(async (req, res) => {
       });
     }
 
-    const section = await prisma.section.findUnique({
-      where: { id: sectionId },
-      include: { course: true },
-    });
+    const totalPointsNum = parseInt(totalPoints);
+    if (isNaN(totalPointsNum) || totalPointsNum <= 0) {
+      await cleanupUploadedFiles();
+      return res.status(400).json({
+        success: false,
+        message: "Total points must be a positive number",
+        code: "INVALID_TOTAL_POINTS",
+      });
+    }
+
+    const [section, lastAssignment] = await Promise.all([
+      prisma.section.findUnique({
+        where: { id: sectionId },
+        select: {
+          id: true,
+          course: {
+            select: {
+              id: true,
+              instructorId: true,
+              title: true,
+            },
+          },
+        },
+      }),
+      prisma.assignment.findFirst({
+        where: { sectionId },
+        orderBy: { order: "desc" },
+        select: { order: true },
+      }),
+    ]);
 
     if (!section) {
+      await cleanupUploadedFiles();
       return res.status(404).json({
         success: false,
         message: "Section not found",
@@ -2529,6 +2578,7 @@ export const createAssignment = asyncHandler(async (req, res) => {
     }
 
     if (section.course.instructorId !== instructorId) {
+      await cleanupUploadedFiles();
       return res.status(403).json({
         success: false,
         message: "Access denied. You don't own this course.",
@@ -2536,12 +2586,33 @@ export const createAssignment = asyncHandler(async (req, res) => {
       });
     }
 
-    const lastAssignment = await prisma.assignment.findFirst({
-      where: { sectionId },
-      orderBy: { order: "desc" },
-    });
+    const resources =
+      req.files?.length > 0
+        ? req.files.map((file) => ({
+            filename: file.originalname,
+            url: file.path,
+            publicId: file.filename,
+            size: file.size,
+            mimeType: file.mimetype,
+            uploadedAt: new Date().toISOString(),
+          }))
+        : null;
 
     const newOrder = lastAssignment ? lastAssignment.order + 1 : 1;
+
+    let parsedRubric = null;
+    if (rubric) {
+      try {
+        parsedRubric = typeof rubric === "string" ? JSON.parse(rubric) : rubric;
+      } catch (error) {
+        await cleanupUploadedFiles();
+        return res.status(400).json({
+          success: false,
+          message: "Invalid rubric format. Must be valid JSON.",
+          code: "INVALID_RUBRIC_FORMAT",
+        });
+      }
+    }
 
     const assignment = await prisma.assignment.create({
       data: {
@@ -2549,24 +2620,51 @@ export const createAssignment = asyncHandler(async (req, res) => {
         description: description.trim(),
         instructions: instructions.trim(),
         dueDate: dueDate ? new Date(dueDate) : null,
-        totalPoints: parseInt(totalPoints),
+        totalPoints: totalPointsNum,
         order: newOrder,
-        resources: resources || null,
-        rubric: rubric || null,
-        allowLateSubmission,
+        resources,
+        rubric: parsedRubric,
+        allowLateSubmission: Boolean(allowLateSubmission),
         latePenalty: latePenalty ? parseFloat(latePenalty) : null,
         sectionId,
       },
+      select: {
+        id: true,
+        title: true,
+        description: true,
+        instructions: true,
+        dueDate: true,
+        totalPoints: true,
+        order: true,
+        resources: true,
+        rubric: true,
+        allowLateSubmission: true,
+        latePenalty: true,
+        createdAt: true,
+        updatedAt: true,
+      },
     });
 
-    await clearContentCache(section.course.id);
+    setImmediate(async () => {
+      try {
+        await clearContentCache(section.course.id);
+      } catch (error) {
+        console.error("Cache cleanup failed:", error);
+      }
+    });
 
     const executionTime = performance.now() - startTime;
 
     res.status(201).json({
       success: true,
       message: "Assignment created successfully",
-      data: { assignment },
+      data: {
+        assignment: {
+          ...assignment,
+          courseTitle: section.course.title,
+          resourcesCount: resources ? resources.length : 0,
+        },
+      },
       meta: {
         requestId,
         executionTime: Math.round(executionTime),
@@ -2574,6 +2672,8 @@ export const createAssignment = asyncHandler(async (req, res) => {
       },
     });
   } catch (error) {
+    await cleanupUploadedFiles();
+
     console.error(`CREATE_ASSIGNMENT_ERROR [${requestId}]:`, {
       error: error.message,
       stack: error.stack,
@@ -2600,6 +2700,51 @@ export const updateAssignment = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();
   const startTime = performance.now();
 
+  const cleanupUploadedFiles = async () => {
+    if (req.files?.length > 0) {
+      const cleanupPromises = req.files.map(async (file) => {
+        try {
+          if (file.filename) {
+            let resourceType = "raw";
+            if (file.mimetype?.startsWith("image/")) {
+              resourceType = "image";
+            } else if (file.mimetype?.startsWith("video/")) {
+              resourceType = "video";
+            }
+            await deleteFromCloudinary(file.filename, resourceType);
+          }
+        } catch (error) {
+          console.error(`Failed to cleanup file ${file.filename}:`, error);
+        }
+      });
+      await Promise.allSettled(cleanupPromises);
+    }
+  };
+
+  const cleanupOldFiles = async (oldResources) => {
+    if (oldResources && Array.isArray(oldResources)) {
+      const cleanupPromises = oldResources.map(async (resource) => {
+        try {
+          if (resource.publicId) {
+            let resourceType = "raw";
+            if (resource.mimeType?.startsWith("image/")) {
+              resourceType = "image";
+            } else if (resource.mimeType?.startsWith("video/")) {
+              resourceType = "video";
+            }
+            await deleteFromCloudinary(resource.publicId, resourceType);
+          }
+        } catch (error) {
+          console.error(
+            `Failed to cleanup old file ${resource.publicId}:`,
+            error
+          );
+        }
+      });
+      await Promise.allSettled(cleanupPromises);
+    }
+  };
+
   try {
     const { assignmentId } = req.params;
     const {
@@ -2608,24 +2753,48 @@ export const updateAssignment = asyncHandler(async (req, res) => {
       instructions,
       dueDate,
       totalPoints,
-      resources,
       rubric,
       allowLateSubmission,
       latePenalty,
+      removeOldFiles = false,
     } = req.body;
     const instructorId = req.instructorProfile.id;
 
     const assignment = await prisma.assignment.findUnique({
       where: { id: assignmentId },
-      include: {
+      select: {
+        id: true,
+        title: true,
+        description: true,
+        instructions: true,
+        dueDate: true,
+        totalPoints: true,
+        resources: true,
+        rubric: true,
+        allowLateSubmission: true,
+        latePenalty: true,
         section: {
-          include: { course: true },
+          select: {
+            id: true,
+            course: {
+              select: {
+                id: true,
+                instructorId: true,
+                title: true,
+              },
+            },
+          },
         },
-        submissions: true,
+        _count: {
+          select: {
+            submissions: true,
+          },
+        },
       },
     });
 
     if (!assignment) {
+      await cleanupUploadedFiles();
       return res.status(404).json({
         success: false,
         message: "Assignment not found",
@@ -2634,6 +2803,7 @@ export const updateAssignment = asyncHandler(async (req, res) => {
     }
 
     if (assignment.section.course.instructorId !== instructorId) {
+      await cleanupUploadedFiles();
       return res.status(403).json({
         success: false,
         message: "Access denied. You don't own this course.",
@@ -2641,26 +2811,44 @@ export const updateAssignment = asyncHandler(async (req, res) => {
       });
     }
 
-    if (assignment.submissions.length > 0) {
-      const restrictedFields = ["totalPoints", "dueDate"];
-      const hasRestrictedChanges = restrictedFields.some((field) => {
-        if (field === "dueDate") {
-          const newDate = dueDate ? new Date(dueDate) : null;
-          const oldDate = assignment.dueDate;
-          return newDate && oldDate && newDate.getTime() !== oldDate.getTime();
-        }
-        return (
-          req.body[field] !== undefined && req.body[field] !== assignment[field]
-        );
-      });
+    if (assignment._count.submissions > 0) {
+      const hasRestrictedChanges =
+        (totalPoints !== undefined &&
+          parseInt(totalPoints) !== assignment.totalPoints) ||
+        (dueDate !== undefined &&
+          new Date(dueDate).getTime() !== assignment.dueDate?.getTime());
 
       if (hasRestrictedChanges) {
+        await cleanupUploadedFiles();
         return res.status(400).json({
           success: false,
           message:
             "Cannot modify scoring criteria or due date for assignment with submissions",
           code: "ASSIGNMENT_HAS_SUBMISSIONS",
         });
+      }
+    }
+
+    let newResources = assignment.resources;
+
+    if (req.files?.length > 0) {
+      const uploadedFiles = req.files.map((file) => ({
+        filename: file.originalname,
+        url: file.path,
+        publicId: file.filename,
+        size: file.size,
+        mimeType: file.mimetype,
+        uploadedAt: new Date().toISOString(),
+      }));
+
+      if (removeOldFiles === "true" || removeOldFiles === true) {
+        newResources = uploadedFiles;
+        setImmediate(() => cleanupOldFiles(assignment.resources));
+      } else {
+        const existingResources = Array.isArray(assignment.resources)
+          ? assignment.resources
+          : [];
+        newResources = [...existingResources, ...uploadedFiles];
       }
     }
 
@@ -2673,26 +2861,73 @@ export const updateAssignment = asyncHandler(async (req, res) => {
       updateData.dueDate = dueDate ? new Date(dueDate) : null;
     if (totalPoints !== undefined)
       updateData.totalPoints = parseInt(totalPoints);
-    if (resources !== undefined) updateData.resources = resources;
-    if (rubric !== undefined) updateData.rubric = rubric;
     if (allowLateSubmission !== undefined)
-      updateData.allowLateSubmission = allowLateSubmission;
+      updateData.allowLateSubmission = Boolean(allowLateSubmission);
     if (latePenalty !== undefined)
       updateData.latePenalty = latePenalty ? parseFloat(latePenalty) : null;
+
+    if (req.files?.length > 0 || removeOldFiles) {
+      updateData.resources = newResources;
+    }
+
+    if (rubric !== undefined) {
+      try {
+        updateData.rubric =
+          typeof rubric === "string" ? JSON.parse(rubric) : rubric;
+      } catch (error) {
+        await cleanupUploadedFiles();
+        return res.status(400).json({
+          success: false,
+          message: "Invalid rubric format. Must be valid JSON.",
+          code: "INVALID_RUBRIC_FORMAT",
+        });
+      }
+    }
 
     const updatedAssignment = await prisma.assignment.update({
       where: { id: assignmentId },
       data: updateData,
+      select: {
+        id: true,
+        title: true,
+        description: true,
+        instructions: true,
+        dueDate: true,
+        totalPoints: true,
+        order: true,
+        resources: true,
+        rubric: true,
+        allowLateSubmission: true,
+        latePenalty: true,
+        createdAt: true,
+        updatedAt: true,
+      },
     });
 
-    await clearContentCache(assignment.section.course.id);
+    setImmediate(async () => {
+      try {
+        await clearContentCache(assignment.section.course.id);
+      } catch (error) {
+        console.error("Cache cleanup failed:", error);
+      }
+    });
 
     const executionTime = performance.now() - startTime;
 
     res.status(200).json({
       success: true,
       message: "Assignment updated successfully",
-      data: { assignment: updatedAssignment },
+      data: {
+        assignment: {
+          ...updatedAssignment,
+          courseTitle: assignment.section.course.title,
+          resourcesCount: newResources
+            ? Array.isArray(newResources)
+              ? newResources.length
+              : 0
+            : 0,
+        },
+      },
       meta: {
         requestId,
         executionTime: Math.round(executionTime),
@@ -2700,6 +2935,8 @@ export const updateAssignment = asyncHandler(async (req, res) => {
       },
     });
   } catch (error) {
+    await cleanupUploadedFiles();
+
     console.error(`UPDATE_ASSIGNMENT_ERROR [${requestId}]:`, {
       error: error.message,
       stack: error.stack,
@@ -2822,133 +3059,37 @@ export const deleteAssignment = asyncHandler(async (req, res) => {
   }
 });
 
-export const addLessonAttachment = asyncHandler(async (req, res) => {
+export const getAllAssignments = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();
   const startTime = performance.now();
 
   try {
-    const { lessonId } = req.params;
-    const {
-      name,
-      fileUrl,
-      fileSize,
-      fileType,
-      isDownloadable = true,
-    } = req.body;
+    const { sectionId } = req.params;
     const instructorId = req.instructorProfile.id;
 
-    if (!name || !fileUrl || !fileSize || !fileType) {
-      return res.status(400).json({
-        success: false,
-        message: "Name, file URL, file size, and file type are required",
-        code: "VALIDATION_ERROR",
-      });
-    }
-
-    const lesson = await prisma.lesson.findUnique({
-      where: { id: lessonId },
-      include: {
-        section: {
-          include: { course: true },
-        },
-      },
-    });
-
-    if (!lesson) {
-      return res.status(404).json({
-        success: false,
-        message: "Lesson not found",
-        code: "LESSON_NOT_FOUND",
-      });
-    }
-
-    if (lesson.section.course.instructorId !== instructorId) {
-      return res.status(403).json({
-        success: false,
-        message: "Access denied. You don't own this course.",
-        code: "COURSE_ACCESS_DENIED",
-      });
-    }
-
-    const attachment = await prisma.attachment.create({
-      data: {
-        name: name.trim(),
-        fileUrl: fileUrl.trim(),
-        fileSize: parseInt(fileSize),
-        fileType: fileType.trim(),
-        isDownloadable,
-        lessonId,
-      },
-    });
-
-    await clearContentCache(lesson.section.course.id);
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(201).json({
-      success: true,
-      message: "Attachment added successfully",
-      data: { attachment },
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error(`ADD_ATTACHMENT_ERROR [${requestId}]:`, {
-      error: error.message,
-      stack: error.stack,
-      lessonId: req.params.lessonId,
-      instructorId: req.instructorProfile?.id,
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to add attachment",
-      code: "ADD_ATTACHMENT_ERROR",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
-export const updateLessonAttachment = asyncHandler(async (req, res) => {
-  const requestId = generateRequestId();
-  const startTime = performance.now();
-
-  try {
-    const { attachmentId } = req.params;
-    const { name, isDownloadable } = req.body;
-    const instructorId = req.instructorProfile.id;
-
-    const attachment = await prisma.attachment.findUnique({
-      where: { id: attachmentId },
-      include: {
-        lesson: {
-          include: {
-            section: {
-              include: { course: true },
-            },
+    const section = await prisma.section.findUnique({
+      where: { id: sectionId },
+      select: {
+        id: true,
+        course: {
+          select: {
+            id: true,
+            instructorId: true,
+            title: true,
           },
         },
       },
     });
 
-    if (!attachment) {
+    if (!section) {
       return res.status(404).json({
         success: false,
-        message: "Attachment not found",
-        code: "ATTACHMENT_NOT_FOUND",
+        message: "Section not found",
+        code: "SECTION_NOT_FOUND",
       });
     }
 
-    if (attachment.lesson.section.course.instructorId !== instructorId) {
+    if (section.course.instructorId !== instructorId) {
       return res.status(403).json({
         success: false,
         message: "Access denied. You don't own this course.",
@@ -2956,24 +3097,32 @@ export const updateLessonAttachment = asyncHandler(async (req, res) => {
       });
     }
 
-    const updateData = {};
-    if (name !== undefined) updateData.name = name.trim();
-    if (isDownloadable !== undefined)
-      updateData.isDownloadable = isDownloadable;
-
-    const updatedAttachment = await prisma.attachment.update({
-      where: { id: attachmentId },
-      data: updateData,
+    const assignments = await prisma.assignment.findMany({
+      where: { sectionId },
+      orderBy: { order: "asc" },
+      select: {
+        id: true,
+        title: true,
+        description: true,
+        instructions: true,
+        dueDate: true,
+        totalPoints: true,
+        order: true,
+        resources: true,
+        rubric: true,
+        allowLateSubmission: true,
+        latePenalty: true,
+        createdAt: true,
+        updatedAt: true,
+      },
     });
-
-    await clearContentCache(attachment.lesson.section.course.id);
 
     const executionTime = performance.now() - startTime;
 
     res.status(200).json({
       success: true,
-      message: "Attachment updated successfully",
-      data: { attachment: updatedAttachment },
+      message: "Assignments fetched successfully",
+      data: { assignments },
       meta: {
         requestId,
         executionTime: Math.round(executionTime),
@@ -2981,10 +3130,10 @@ export const updateLessonAttachment = asyncHandler(async (req, res) => {
       },
     });
   } catch (error) {
-    console.error(`UPDATE_ATTACHMENT_ERROR [${requestId}]:`, {
+    console.error(`GET_ASSIGNMENTS_ERROR [${requestId}]:`, {
       error: error.message,
       stack: error.stack,
-      attachmentId: req.params.attachmentId,
+      sectionId: req.params.sectionId,
       instructorId: req.instructorProfile?.id,
     });
 
@@ -2992,94 +3141,8 @@ export const updateLessonAttachment = asyncHandler(async (req, res) => {
 
     res.status(500).json({
       success: false,
-      message: "Failed to update attachment",
-      code: "UPDATE_ATTACHMENT_ERROR",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
-export const deleteLessonAttachment = asyncHandler(async (req, res) => {
-  const requestId = generateRequestId();
-  const startTime = performance.now();
-
-  try {
-    const { attachmentId } = req.params;
-    const instructorId = req.instructorProfile.id;
-
-    const attachment = await prisma.attachment.findUnique({
-      where: { id: attachmentId },
-      include: {
-        lesson: {
-          include: {
-            section: {
-              include: { course: true },
-            },
-          },
-        },
-      },
-    });
-
-    if (!attachment) {
-      return res.status(404).json({
-        success: false,
-        message: "Attachment not found",
-        code: "ATTACHMENT_NOT_FOUND",
-      });
-    }
-
-    if (attachment.lesson.section.course.instructorId !== instructorId) {
-      return res.status(403).json({
-        success: false,
-        message: "Access denied. You don't own this course.",
-        code: "COURSE_ACCESS_DENIED",
-      });
-    }
-
-    try {
-      if (attachment.fileUrl.includes("cloudinary.com")) {
-        const publicId = attachment.fileUrl.split("/").pop().split(".")[0];
-        await cloudinary.uploader.destroy(publicId);
-      }
-    } catch (cloudinaryError) {
-      console.error("Failed to delete file from cloudinary:", cloudinaryError);
-    }
-
-    await prisma.attachment.delete({
-      where: { id: attachmentId },
-    });
-
-    await clearContentCache(attachment.lesson.section.course.id);
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(200).json({
-      success: true,
-      message: "Attachment deleted successfully",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error(`DELETE_ATTACHMENT_ERROR [${requestId}]:`, {
-      error: error.message,
-      stack: error.stack,
-      attachmentId: req.params.attachmentId,
-      instructorId: req.instructorProfile?.id,
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to delete attachment",
-      code: "DELETE_ATTACHMENT_ERROR",
+      message: "Failed to fetch assignments",
+      code: "GET_ASSIGNMENTS_ERROR",
       meta: {
         requestId,
         executionTime: Math.round(executionTime),

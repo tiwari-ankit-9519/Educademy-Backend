@@ -26,7 +26,6 @@ const isLoggedIn = async (req, res, next) => {
   }
 
   try {
-    // First check if token is blacklisted
     const isBlacklisted = await isTokenBlacklisted(token);
     if (isBlacklisted) {
       return res.status(401).json({
@@ -36,10 +35,8 @@ const isLoggedIn = async (req, res, next) => {
       });
     }
 
-    // Verify JWT token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // Check if session exists in Redis
     const sessionData = await redisService.getJSON(`session:${token}`);
     if (!sessionData) {
       return res.status(401).json({
@@ -49,9 +46,7 @@ const isLoggedIn = async (req, res, next) => {
       });
     }
 
-    // Check if session has expired
     if (new Date(sessionData.expiresAt) < new Date()) {
-      // Clean up expired session
       await redisService.del(`session:${token}`);
       const userSessionsKey = `user_sessions:${sessionData.userId}`;
       await redisService.srem(userSessionsKey, token);
@@ -63,7 +58,6 @@ const isLoggedIn = async (req, res, next) => {
       });
     }
 
-    // Get user from cache or database
     const userCacheKey = `user:${decoded.id}`;
     let user = await redisService.getJSON(userCacheKey);
 
@@ -88,17 +82,21 @@ const isLoggedIn = async (req, res, next) => {
               isVerified: true,
             },
           },
+          studentProfile: {
+            select: {
+              id: true,
+              skillLevel: true,
+            },
+          },
         },
       });
 
       if (user) {
-        // Cache user for 15 minutes
         await redisService.setJSON(userCacheKey, user, { ex: 900 });
       }
     }
 
     if (!user) {
-      // User deleted but token still valid - blacklist token
       await redisService.set(`blacklist:${token}`, "true", {
         ex: decoded.exp - Math.floor(Date.now() / 1000),
       });
@@ -110,7 +108,6 @@ const isLoggedIn = async (req, res, next) => {
     }
 
     if (!user.isActive) {
-      // User deactivated - blacklist token
       await redisService.set(`blacklist:${token}`, "true", {
         ex: decoded.exp - Math.floor(Date.now() / 1000),
       });
@@ -121,13 +118,11 @@ const isLoggedIn = async (req, res, next) => {
       });
     }
 
-    // Update session activity
     sessionData.lastActivity = new Date().toISOString();
     await redisService.setJSON(`session:${token}`, sessionData, {
       ex: 30 * 24 * 60 * 60,
     });
 
-    // Set user info in request
     req.userAuthId = user.id;
     req.userRole = user.role;
     req.userProfile = user;
@@ -168,14 +163,6 @@ const isAdmin = async (req, res, next) => {
         code: "AUTH_REQUIRED",
       });
     }
-
-    // if (!["ADMIN", "SUPER_ADMIN", "MODERATOR"].includes(req.userRole)) {
-    //   return res.status(403).json({
-    //     success: false,
-    //     message: "Access denied. Admin privileges required.",
-    //     code: "INSUFFICIENT_PERMISSIONS",
-    //   });
-    // }
 
     next();
   } catch (error) {
@@ -246,14 +233,6 @@ const isInstructor = async (req, res, next) => {
       });
     }
 
-    // if (!instructorProfile.isVerified) {
-    //   return res.status(403).json({
-    //     success: false,
-    //     message: "Instructor profile pending admin approval.",
-    //     code: "PROFILE_NOT_VERIFIED",
-    //   });
-    // }
-
     req.instructorProfile = instructorProfile;
     next();
   } catch (error) {
@@ -266,14 +245,87 @@ const isInstructor = async (req, res, next) => {
   }
 };
 
+const isStudent = async (req, res, next) => {
+  try {
+    if (!req.userAuthId || !req.userRole) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+        code: "AUTH_REQUIRED",
+      });
+    }
+
+    if (req.userRole !== "STUDENT") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. Student privileges required.",
+        code: "INSUFFICIENT_PERMISSIONS",
+      });
+    }
+
+    if (!req.userProfile?.studentProfile) {
+      return res.status(403).json({
+        success: false,
+        message: "Student profile not found. Complete your student setup.",
+        code: "PROFILE_INCOMPLETE",
+      });
+    }
+
+    const studentProfile = await prisma.student.findUnique({
+      where: { userId: req.userAuthId },
+      select: {
+        id: true,
+        skillLevel: true,
+        totalLearningTime: true,
+        user: {
+          select: {
+            isActive: true,
+            isVerified: true,
+          },
+        },
+      },
+    });
+
+    if (!studentProfile) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Student profile not found. Complete your student registration.",
+        code: "PROFILE_NOT_FOUND",
+      });
+    }
+
+    if (!studentProfile.user.isVerified) {
+      return res.status(403).json({
+        success: false,
+        message: "Account pending email verification.",
+        code: "EMAIL_NOT_VERIFIED",
+      });
+    }
+
+    req.studentProfile = studentProfile;
+    next();
+  } catch (error) {
+    console.error("Student authorization error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Authorization verification failed",
+      code: "AUTH_VERIFICATION_ERROR",
+    });
+  }
+};
+
 const requireAdmin = [isLoggedIn, isAdmin];
 const requireInstructor = [isLoggedIn, isInstructor];
+const requireStudent = [isLoggedIn, isStudent];
 
 export {
   isAdmin,
   isInstructor,
+  isStudent,
   requireAdmin,
   requireInstructor,
+  requireStudent,
   isTokenBlacklisted,
   isLoggedIn,
 };

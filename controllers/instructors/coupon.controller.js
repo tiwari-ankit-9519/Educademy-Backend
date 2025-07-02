@@ -27,8 +27,6 @@ export const createCoupon = asyncHandler(async (req, res) => {
       validUntil,
       applicableTo,
       courseIds,
-      categoryIds,
-      instructorIds,
     } = req.body;
 
     if (!code || !title || !type || !value || !validFrom || !validUntil) {
@@ -63,9 +61,23 @@ export const createCoupon = asyncHandler(async (req, res) => {
       });
     }
 
-    const existingCoupon = await prisma.coupon.findUnique({
-      where: { code: code.toUpperCase() },
-    });
+    const [instructor, existingCoupon] = await Promise.all([
+      prisma.instructor.findUnique({
+        where: { userId: req.userAuthId },
+        select: { id: true },
+      }),
+      prisma.coupon.findUnique({
+        where: { code: code.toUpperCase() },
+      }),
+    ]);
+
+    if (!instructor) {
+      return res.status(404).json({
+        success: false,
+        message: "Instructor profile not found",
+        code: "INSTRUCTOR_NOT_FOUND",
+      });
+    }
 
     if (existingCoupon) {
       return res.status(409).json({
@@ -73,6 +85,25 @@ export const createCoupon = asyncHandler(async (req, res) => {
         message: "Coupon code already exists",
         code: "DUPLICATE_CODE",
       });
+    }
+
+    if (applicableTo === "SPECIFIC_COURSES" && courseIds?.length > 0) {
+      const instructorCourses = await prisma.course.findMany({
+        where: {
+          id: { in: courseIds },
+          instructorId: instructor.id,
+          status: { not: "ARCHIVED" },
+        },
+        select: { id: true },
+      });
+
+      if (instructorCourses.length !== courseIds.length) {
+        return res.status(403).json({
+          success: false,
+          message: "You can only create coupons for your own courses",
+          code: "INVALID_COURSE_ACCESS",
+        });
+      }
     }
 
     const couponData = {
@@ -124,23 +155,28 @@ export const createCoupon = asyncHandler(async (req, res) => {
       return newCoupon;
     });
 
-    await redisService.del("coupons:*");
-
-    const cacheKey = `coupon:${coupon.id}`;
-    await redisService.setJSON(cacheKey, coupon, { ex: 3600 });
-
-    if (req.userRole === "ADMIN") {
-      await notificationService.createNotification({
-        userId: req.userAuthId,
-        type: "coupon_created",
-        title: "Coupon Created Successfully",
-        message: `Coupon "${title}" has been created successfully`,
-        data: {
-          couponId: coupon.id,
-          couponCode: coupon.code,
-        },
-      });
-    }
+    setImmediate(async () => {
+      try {
+        await Promise.all([
+          redisService.del("coupons:*"),
+          redisService.setJSON(`coupon:${coupon.id}`, coupon, { ex: 3600 }),
+          notificationService.createNotification({
+            userId: req.userAuthId,
+            type: "SYSTEM_ANNOUNCEMENT",
+            title: "Coupon Created Successfully",
+            message: `Coupon "${title}" has been created successfully`,
+            data: {
+              couponId: coupon.id,
+              couponCode: coupon.code,
+              notificationType: "coupon_created",
+            },
+            actionUrl: "/instructor/coupons",
+          }),
+        ]);
+      } catch (error) {
+        console.error("Background operations failed:", error);
+      }
+    });
 
     const executionTime = performance.now() - startTime;
 
@@ -904,216 +940,6 @@ export const deleteCoupon = asyncHandler(async (req, res) => {
   }
 });
 
-export const validateCoupon = asyncHandler(async (req, res) => {
-  const requestId = generateRequestId();
-  const startTime = performance.now();
-
-  try {
-    const { code, courseIds, cartTotal } = req.body;
-
-    if (!code) {
-      return res.status(400).json({
-        success: false,
-        message: "Coupon code is required",
-        code: "VALIDATION_ERROR",
-      });
-    }
-
-    const cacheKey = `coupon_validation:${code}:${JSON.stringify(
-      courseIds
-    )}:${cartTotal}:${req.userAuthId}`;
-    let cachedResult = await redisService.getJSON(cacheKey);
-
-    if (cachedResult) {
-      const executionTime = performance.now() - startTime;
-      return res.status(200).json({
-        success: true,
-        message: "Coupon validation completed",
-        data: cachedResult,
-        meta: {
-          requestId,
-          executionTime: Math.round(executionTime),
-          timestamp: new Date().toISOString(),
-          cacheHit: true,
-        },
-      });
-    }
-
-    const coupon = await prisma.coupon.findUnique({
-      where: { code: code.toUpperCase() },
-      include: {
-        courses: {
-          select: { id: true },
-        },
-        usages: {
-          where: { userId: req.userAuthId },
-        },
-      },
-    });
-
-    if (!coupon) {
-      return res.status(404).json({
-        success: false,
-        message: "Invalid coupon code",
-        code: "INVALID_COUPON",
-      });
-    }
-
-    if (!coupon.isActive) {
-      return res.status(400).json({
-        success: false,
-        message: "Coupon is not active",
-        code: "COUPON_INACTIVE",
-      });
-    }
-
-    const now = new Date();
-    if (now < coupon.validFrom) {
-      return res.status(400).json({
-        success: false,
-        message: "Coupon is not yet valid",
-        code: "COUPON_NOT_YET_VALID",
-        data: {
-          validFrom: coupon.validFrom,
-        },
-      });
-    }
-
-    if (now > coupon.validUntil) {
-      return res.status(400).json({
-        success: false,
-        message: "Coupon has expired",
-        code: "COUPON_EXPIRED",
-        data: {
-          validUntil: coupon.validUntil,
-        },
-      });
-    }
-
-    if (coupon.usageLimit && coupon.usedCount >= coupon.usageLimit) {
-      return res.status(400).json({
-        success: false,
-        message: "Coupon usage limit reached",
-        code: "USAGE_LIMIT_REACHED",
-        data: {
-          usageLimit: coupon.usageLimit,
-          usedCount: coupon.usedCount,
-        },
-      });
-    }
-
-    if (coupon.usages.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message: "You have already used this coupon",
-        code: "ALREADY_USED",
-      });
-    }
-
-    if (
-      coupon.applicableTo === "SPECIFIC_COURSES" &&
-      courseIds &&
-      courseIds.length > 0
-    ) {
-      const applicableCourseIds = coupon.courses.map((c) => c.id);
-      const validCourses = courseIds.filter((id) =>
-        applicableCourseIds.includes(id)
-      );
-
-      if (validCourses.length === 0) {
-        return res.status(400).json({
-          success: false,
-          message: "Coupon is not applicable to any items in your cart",
-          code: "NOT_APPLICABLE",
-        });
-      }
-    }
-
-    if (coupon.minimumAmount && cartTotal < coupon.minimumAmount) {
-      return res.status(400).json({
-        success: false,
-        message: `Minimum cart amount of ₹${coupon.minimumAmount} required`,
-        code: "MINIMUM_AMOUNT_NOT_MET",
-        data: {
-          minimumAmount: coupon.minimumAmount,
-          cartTotal: cartTotal,
-        },
-      });
-    }
-
-    let discountAmount = 0;
-    if (coupon.type === "PERCENTAGE") {
-      discountAmount = (cartTotal * coupon.value) / 100;
-      if (coupon.maximumDiscount) {
-        discountAmount = Math.min(discountAmount, coupon.maximumDiscount);
-      }
-    } else {
-      discountAmount = Math.min(coupon.value, cartTotal);
-    }
-
-    const finalAmount = Math.max(0, cartTotal - discountAmount);
-
-    const result = {
-      isValid: true,
-      coupon: {
-        id: coupon.id,
-        code: coupon.code,
-        title: coupon.title,
-        type: coupon.type,
-        value: coupon.value,
-        applicableTo: coupon.applicableTo,
-      },
-      discount: {
-        amount: discountAmount,
-        percentage: Math.round((discountAmount / cartTotal) * 100),
-        type: coupon.type,
-      },
-      totals: {
-        originalAmount: cartTotal,
-        discountAmount: discountAmount,
-        finalAmount: finalAmount,
-        savings: discountAmount,
-      },
-    };
-
-    await redisService.setJSON(cacheKey, result, { ex: 300 });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(200).json({
-      success: true,
-      message: "Coupon is valid",
-      data: result,
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-        cacheHit: false,
-      },
-    });
-  } catch (error) {
-    console.error(`VALIDATE_COUPON_ERROR [${requestId}]:`, {
-      error: error.message,
-      stack: error.stack,
-      body: req.body,
-      userId: req.userAuthId,
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to validate coupon",
-      code: "INTERNAL_SERVER_ERROR",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
 export const applyCoupon = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();
   const startTime = performance.now();
@@ -1359,6 +1185,12 @@ export const getCouponAnalytics = asyncHandler(async (req, res) => {
       where.couponId = couponId;
     }
 
+    const paymentWhere = {
+      couponUsages: {
+        some: where,
+      },
+    };
+
     const [
       totalUsages,
       totalDiscount,
@@ -1374,39 +1206,42 @@ export const getCouponAnalytics = asyncHandler(async (req, res) => {
         where,
         _sum: { discount: true },
       }),
-      prisma.couponUsage.aggregate({
-        where,
-        _sum: {
-          payment: {
-            amount: true,
-          },
-        },
+      prisma.payment.aggregate({
+        where: paymentWhere,
+        _sum: { amount: true },
       }),
       prisma.couponUsage.groupBy({
         by: ["createdAt"],
         where,
-        _count: { _all: true },
+        _count: { id: true },
         _sum: { discount: true },
         orderBy: { createdAt: "asc" },
       }),
       prisma.couponUsage.groupBy({
         by: ["couponId"],
         where,
-        _count: { _all: true },
+        _count: { id: true },
         _sum: { discount: true },
-        orderBy: { _count: { _all: "desc" } },
+        orderBy: { _count: { id: "desc" } },
         take: 10,
       }),
-      prisma.couponUsage.groupBy({
-        by: ["coupon", "type"],
+      prisma.coupon.groupBy({
+        by: ["type"],
         where: {
-          ...where,
-          coupon: {
-            createdById: req.userRole === "ADMIN" ? undefined : req.userAuthId,
+          createdById: req.userRole === "ADMIN" ? undefined : req.userAuthId,
+          usages: {
+            some: {
+              createdAt: {
+                gte: startDate,
+                lte: endDate,
+              },
+            },
           },
         },
-        _count: { _all: true },
-        _sum: { discount: true },
+        _count: { id: true },
+        _sum: {
+          usedCount: true,
+        },
       }),
       prisma.couponUsage.aggregate({
         where,
@@ -1463,8 +1298,8 @@ export const getCouponAnalytics = asyncHandler(async (req, res) => {
       if (!acc[key]) {
         acc[key] = { count: 0, discount: 0 };
       }
-      acc[key].count += usage._count._all;
-      acc[key].discount += usage._sum.discount || 0;
+      acc[key].count += usage._count.id;
+      acc[key].discount += Number(usage._sum.discount || 0);
 
       return acc;
     }, {});
@@ -1477,20 +1312,20 @@ export const getCouponAnalytics = asyncHandler(async (req, res) => {
     const result = {
       summary: {
         totalUsages,
-        totalDiscount: totalDiscount._sum.discount || 0,
-        totalRevenue: totalRevenue._sum.amount || 0,
-        averageDiscount: averageDiscount._avg.discount || 0,
+        totalDiscount: Number(totalDiscount._sum.discount || 0),
+        totalRevenue: Number(totalRevenue._sum.amount || 0),
+        averageDiscount: Number(averageDiscount._avg.discount || 0),
         conversionRate: Math.round(conversionRate * 100) / 100,
         period: { from: startDate, to: endDate },
       },
       trends: {
-        usagesByPeriod: Object.entries(processedUsagesByPeriod).map(
-          ([date, data]) => ({
+        usagesByPeriod: Object.entries(processedUsagesByPeriod)
+          .map(([date, data]) => ({
             date,
             usages: data.count,
             discount: data.discount,
-          })
-        ),
+          }))
+          .sort((a, b) => new Date(a.date) - new Date(b.date)),
       },
       topPerformers: topCoupons.map((tc) => {
         const details = topCouponsWithDetails.find((d) => d.id === tc.couponId);
@@ -1499,16 +1334,16 @@ export const getCouponAnalytics = asyncHandler(async (req, res) => {
           code: details?.code,
           title: details?.title,
           type: details?.type,
-          value: details?.value,
-          usages: tc._count._all,
-          totalDiscount: tc._sum.discount || 0,
+          value: Number(details?.value || 0),
+          usages: tc._count.id,
+          totalDiscount: Number(tc._sum.discount || 0),
         };
       }),
       breakdown: {
         byType: usagesByType.map((ut) => ({
-          type: ut.coupon.type,
-          usages: ut._count._all,
-          totalDiscount: ut._sum.discount || 0,
+          type: ut.type,
+          usages: ut._count.id,
+          totalUsages: ut._sum.usedCount || 0,
         })),
       },
       performance: conversionMetrics.map((cm) => ({
@@ -1519,6 +1354,9 @@ export const getCouponAnalytics = asyncHandler(async (req, res) => {
             ? Math.round((cm.usedCount / cm.usageLimit) * 100)
             : null,
         totalUsages: cm._count.usages,
+        remainingUses: cm.usageLimit
+          ? Math.max(0, cm.usageLimit - cm.usedCount)
+          : null,
       })),
     };
 
@@ -1560,155 +1398,6 @@ export const getCouponAnalytics = asyncHandler(async (req, res) => {
   }
 });
 
-export const getCouponUsageHistory = asyncHandler(async (req, res) => {
-  const requestId = generateRequestId();
-  const startTime = performance.now();
-
-  try {
-    const { couponId } = req.params;
-    const {
-      page = 1,
-      limit = 20,
-      sortBy = "createdAt",
-      sortOrder = "desc",
-    } = req.query;
-
-    const pageSize = Math.min(parseInt(limit), 100);
-    const pageNumber = Math.max(parseInt(page), 1);
-    const skip = (pageNumber - 1) * pageSize;
-
-    const coupon = await prisma.coupon.findUnique({
-      where: { id: couponId },
-      select: {
-        id: true,
-        createdById: true,
-      },
-    });
-
-    if (!coupon) {
-      return res.status(404).json({
-        success: false,
-        message: "Coupon not found",
-        code: "COUPON_NOT_FOUND",
-      });
-    }
-
-    if (req.userRole !== "ADMIN" && coupon.createdById !== req.userAuthId) {
-      return res.status(403).json({
-        success: false,
-        message: "Access denied",
-        code: "ACCESS_DENIED",
-      });
-    }
-
-    const where = { couponId };
-
-    let orderBy = { createdAt: "desc" };
-    if (sortBy === "discount") {
-      orderBy = { discount: sortOrder };
-    } else if (sortBy === "user") {
-      orderBy = { user: { firstName: sortOrder } };
-    }
-
-    const [usages, total] = await Promise.all([
-      prisma.couponUsage.findMany({
-        where,
-        orderBy,
-        skip,
-        take: pageSize,
-        include: {
-          user: {
-            select: {
-              firstName: true,
-              lastName: true,
-              email: true,
-              profileImage: true,
-            },
-          },
-          payment: {
-            select: {
-              amount: true,
-              currency: true,
-              createdAt: true,
-              status: true,
-            },
-          },
-          coupon: {
-            select: {
-              code: true,
-              title: true,
-              type: true,
-              value: true,
-            },
-          },
-        },
-      }),
-      prisma.couponUsage.count({ where }),
-    ]);
-
-    const result = {
-      usages: usages.map((usage) => ({
-        id: usage.id,
-        discount: usage.discount,
-        createdAt: usage.createdAt,
-        user: {
-          name: `${usage.user.firstName} ${usage.user.lastName}`,
-          email: usage.user.email,
-          profileImage: usage.user.profileImage,
-        },
-        payment: {
-          amount: usage.payment.amount,
-          currency: usage.payment.currency,
-          status: usage.payment.status,
-          date: usage.payment.createdAt,
-        },
-        coupon: usage.coupon,
-      })),
-      pagination: {
-        page: pageNumber,
-        limit: pageSize,
-        total,
-        totalPages: Math.ceil(total / pageSize),
-        hasNext: skip + pageSize < total,
-        hasPrev: pageNumber > 1,
-      },
-    };
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(200).json({
-      success: true,
-      message: "Coupon usage history retrieved successfully",
-      data: result,
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error(`GET_COUPON_USAGE_HISTORY_ERROR [${requestId}]:`, {
-      error: error.message,
-      stack: error.stack,
-      couponId: req.params.couponId,
-      userId: req.userAuthId,
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to retrieve coupon usage history",
-      code: "INTERNAL_SERVER_ERROR",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
 export const toggleCouponStatus = asyncHandler(async (req, res) => {
   const requestId = generateRequestId();
   const startTime = performance.now();
@@ -1716,16 +1405,30 @@ export const toggleCouponStatus = asyncHandler(async (req, res) => {
   try {
     const { couponId } = req.params;
 
-    const coupon = await prisma.coupon.findUnique({
-      where: { id: couponId },
-      select: {
-        id: true,
-        code: true,
-        title: true,
-        isActive: true,
-        createdById: true,
-      },
-    });
+    const [instructor, coupon] = await Promise.all([
+      prisma.instructor.findUnique({
+        where: { userId: req.userAuthId },
+        select: { id: true },
+      }),
+      prisma.coupon.findUnique({
+        where: { id: couponId },
+        select: {
+          id: true,
+          code: true,
+          title: true,
+          isActive: true,
+          createdById: true,
+        },
+      }),
+    ]);
+
+    if (!instructor) {
+      return res.status(404).json({
+        success: false,
+        message: "Instructor profile not found",
+        code: "INSTRUCTOR_NOT_FOUND",
+      });
+    }
 
     if (!coupon) {
       return res.status(404).json({
@@ -1735,10 +1438,10 @@ export const toggleCouponStatus = asyncHandler(async (req, res) => {
       });
     }
 
-    if (req.userRole !== "ADMIN" && coupon.createdById !== req.userAuthId) {
+    if (coupon.createdById !== req.userAuthId) {
       return res.status(403).json({
         success: false,
-        message: "Access denied",
+        message: "You can only modify coupons created by you",
         code: "ACCESS_DENIED",
       });
     }
@@ -1757,8 +1460,16 @@ export const toggleCouponStatus = asyncHandler(async (req, res) => {
       },
     });
 
-    await redisService.del(`coupon:${couponId}`);
-    await redisService.del("coupons:*");
+    setImmediate(async () => {
+      try {
+        await Promise.all([
+          redisService.del(`coupon:${couponId}`),
+          redisService.delPattern("coupons:*"),
+        ]);
+      } catch (error) {
+        console.warn("Cache cleanup failed:", error);
+      }
+    });
 
     const executionTime = performance.now() - startTime;
 
@@ -1940,213 +1651,6 @@ export const bulkUpdateCoupons = asyncHandler(async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to update coupons",
-      code: "INTERNAL_SERVER_ERROR",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
-export const getCouponPerformanceReport = asyncHandler(async (req, res) => {
-  const requestId = generateRequestId();
-  const startTime = performance.now();
-
-  try {
-    const { period = "30d", format = "json" } = req.query;
-
-    const cacheKey = `coupon_performance_report:${period}:${req.userAuthId}:${req.userRole}`;
-    let cachedResult = await redisService.getJSON(cacheKey);
-
-    if (cachedResult && format === "json") {
-      const executionTime = performance.now() - startTime;
-      return res.status(200).json({
-        success: true,
-        message: "Performance report retrieved successfully",
-        data: cachedResult,
-        meta: {
-          requestId,
-          executionTime: Math.round(executionTime),
-          timestamp: new Date().toISOString(),
-          cacheHit: true,
-        },
-      });
-    }
-
-    let startDate;
-    const now = new Date();
-
-    switch (period) {
-      case "7d":
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        break;
-      case "30d":
-        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-        break;
-      case "90d":
-        startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-        break;
-      case "1y":
-        startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
-        break;
-      default:
-        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    }
-
-    const where = {
-      ...(req.userRole !== "ADMIN" && { createdById: req.userAuthId }),
-    };
-
-    const [
-      totalCoupons,
-      activeCoupons,
-      expiredCoupons,
-      topPerformers,
-      leastUsed,
-      revenueImpact,
-    ] = await Promise.all([
-      prisma.coupon.count({ where }),
-      prisma.coupon.count({
-        where: { ...where, isActive: true, validUntil: { gte: now } },
-      }),
-      prisma.coupon.count({
-        where: { ...where, validUntil: { lt: now } },
-      }),
-      prisma.coupon.findMany({
-        where: {
-          ...where,
-          usages: {
-            some: {
-              createdAt: { gte: startDate },
-            },
-          },
-        },
-        orderBy: { usedCount: "desc" },
-        take: 10,
-        include: {
-          _count: { select: { usages: true } },
-          usages: {
-            where: { createdAt: { gte: startDate } },
-            select: { discount: true },
-          },
-        },
-      }),
-      prisma.coupon.findMany({
-        where: {
-          ...where,
-          usedCount: 0,
-          validUntil: { gte: now },
-          isActive: true,
-        },
-        take: 10,
-        select: {
-          id: true,
-          code: true,
-          title: true,
-          createdAt: true,
-          validUntil: true,
-        },
-      }),
-      prisma.couponUsage.aggregate({
-        where: {
-          coupon: where,
-          createdAt: { gte: startDate },
-        },
-        _sum: { discount: true },
-        _count: { _all: true },
-      }),
-    ]);
-
-    const report = {
-      period: { from: startDate, to: now },
-      overview: {
-        totalCoupons,
-        activeCoupons,
-        expiredCoupons,
-        inactiveCoupons: totalCoupons - activeCoupons - expiredCoupons,
-      },
-      performance: {
-        totalUsages: revenueImpact._count._all || 0,
-        totalDiscountGiven: revenueImpact._sum.discount || 0,
-        averageDiscountPerUse:
-          revenueImpact._count._all > 0
-            ? revenueImpact._sum.discount / revenueImpact._count._all
-            : 0,
-      },
-      topPerformers: topPerformers.map((coupon) => ({
-        id: coupon.id,
-        code: coupon.code,
-        title: coupon.title,
-        totalUsages: coupon._count.usages,
-        periodUsages: coupon.usages.length,
-        periodDiscount: coupon.usages.reduce(
-          (sum, usage) => sum + usage.discount,
-          0
-        ),
-        type: coupon.type,
-        value: coupon.value,
-      })),
-      underperformers: leastUsed.map((coupon) => ({
-        id: coupon.id,
-        code: coupon.code,
-        title: coupon.title,
-        createdAt: coupon.createdAt,
-        validUntil: coupon.validUntil,
-        daysActive: Math.floor(
-          (now - new Date(coupon.createdAt)) / (1000 * 60 * 60 * 24)
-        ),
-      })),
-      recommendations: [],
-    };
-
-    if (leastUsed.length > 0) {
-      report.recommendations.push(
-        "Consider reviewing unused coupons and adjusting their terms or promotional strategy"
-      );
-    }
-
-    if (expiredCoupons > activeCoupons) {
-      report.recommendations.push(
-        "You have more expired coupons than active ones. Consider creating new promotions"
-      );
-    }
-
-    if (report.performance.averageDiscountPerUse > 100) {
-      report.recommendations.push(
-        "Average discount per use is high. Consider setting maximum discount limits"
-      );
-    }
-
-    await redisService.setJSON(cacheKey, report, { ex: 3600 });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(200).json({
-      success: true,
-      message: "Performance report generated successfully",
-      data: report,
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-        cacheHit: false,
-      },
-    });
-  } catch (error) {
-    console.error(`GET_COUPON_PERFORMANCE_REPORT_ERROR [${requestId}]:`, {
-      error: error.message,
-      stack: error.stack,
-      query: req.query,
-      userId: req.userAuthId,
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to generate performance report",
       code: "INTERNAL_SERVER_ERROR",
       meta: {
         requestId,

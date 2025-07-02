@@ -9,10 +9,8 @@ import {
   replyToReview,
   updateReply,
   deleteReply,
-  getEngagementMetrics,
   getCommunityOverview,
   bulkAnswerQuestions,
-  exportCommunityData,
   markQuestionAsResolved,
 } from "../../controllers/instructors/instructorCommunity.controller.js";
 
@@ -21,8 +19,6 @@ const router = express.Router();
 router.use(requireInstructor);
 
 router.get("/overview", getCommunityOverview);
-router.get("/engagement/metrics", getEngagementMetrics);
-router.get("/export", exportCommunityData);
 
 router.get("/qna/questions", getQnAQuestions);
 router.post("/qna/questions/:questionId/answer", answerQuestion);

@@ -8,10 +8,10 @@ const prisma = new PrismaClient();
 
 export const getEnrolledStudents = asyncHandler(async (req, res) => {
   const instructorId = req.instructorProfile.id;
+  const { courseId } = req.params;
   const {
     page = 1,
     limit = 20,
-    courseId,
     status,
     search,
     sortBy = "enrolledAt",
@@ -1656,7 +1656,8 @@ export const getStudentProgress = asyncHandler(async (req, res) => {
 
 export const getStudentAnalytics = asyncHandler(async (req, res) => {
   const instructorId = req.instructorProfile.id;
-  const { courseId, timeframe = "month", metrics = "all" } = req.query;
+  const { courseId } = req.params;
+  const { timeframe = "month", metrics = "all" } = req.query;
 
   try {
     const cacheKey = `instructor:${instructorId}:analytics:${
@@ -1695,100 +1696,89 @@ export const getStudentAnalytics = asyncHandler(async (req, res) => {
       ...(courseId && { id: courseId }),
     };
 
+    const enrollmentWhere = {
+      course: courseWhere,
+      ...(Object.keys(dateFilter).length > 0 && { createdAt: dateFilter }),
+    };
+
     const [
       enrollmentStats,
-      completionStats,
-      engagementStats,
-      performanceStats,
-      progressDistribution,
+      totalEnrollments,
+      completedEnrollments,
+      engagementData,
+      quizStats,
+      assignmentStats,
       topPerformers,
       strugglingStudents,
     ] = await Promise.all([
       prisma.enrollment.groupBy({
         by: ["status"],
+        where: enrollmentWhere,
+        _count: {
+          id: true,
+        },
+      }),
+
+      prisma.enrollment.count({
+        where: enrollmentWhere,
+      }),
+
+      prisma.enrollment.count({
         where: {
-          course: courseWhere,
-          ...(Object.keys(dateFilter).length > 0 && { createdAt: dateFilter }),
+          ...enrollmentWhere,
+          progress: {
+            gte: 100,
+          },
+        },
+      }),
+
+      prisma.enrollment.aggregate({
+        where: enrollmentWhere,
+        _avg: {
+          progress: true,
+          totalTimeSpent: true,
         },
         _count: {
           id: true,
         },
       }),
 
-      prisma.$queryRaw`
-        SELECT 
-          COUNT(*) as total_students,
-          COUNT(CASE WHEN progress >= 100 THEN 1 END) as completed_students,
-          AVG(progress) as average_progress,
-          COUNT(CASE WHEN progress >= 50 THEN 1 END) as halfway_students
-        FROM "Enrollment" e
-        JOIN "Course" c ON e."courseId" = c.id
-        WHERE c."instructorId" = ${instructorId}
-        AND c.status = 'PUBLISHED'
-        ${courseId ? `AND c.id = '${courseId}'` : ""}
-        ${
-          Object.keys(dateFilter).length > 0
-            ? `AND e."createdAt" >= '${dateFilter.gte.toISOString()}'`
-            : ""
-        }
-      `,
+      prisma.quizAttempt.aggregate({
+        where: {
+          student: {
+            enrollments: {
+              some: enrollmentWhere,
+            },
+          },
+          status: "GRADED",
+        },
+        _avg: {
+          percentage: true,
+        },
+        _count: {
+          id: true,
+        },
+      }),
 
-      prisma.$queryRaw`
-        SELECT 
-          COUNT(DISTINCT lc."studentId") as active_learners,
-          COUNT(lc.id) as total_lesson_completions,
-          AVG(lc."timeSpent") as avg_lesson_time,
-          COUNT(DISTINCT qa.id) as quiz_attempts,
-          COUNT(DISTINCT asub.id) as assignment_submissions
-        FROM "Enrollment" e
-        JOIN "Course" c ON e."courseId" = c.id
-        LEFT JOIN "LessonCompletion" lc ON lc."studentId" = e."studentId" 
-        LEFT JOIN "QuizAttempt" qa ON qa."studentId" = e."studentId"
-        LEFT JOIN "AssignmentSubmission" asub ON asub."studentId" = e."studentId"
-        WHERE c."instructorId" = ${instructorId}
-        AND c.status = 'PUBLISHED'
-        ${courseId ? `AND c.id = '${courseId}'` : ""}
-        ${
-          Object.keys(dateFilter).length > 0
-            ? `AND lc."completedAt" >= '${dateFilter.gte.toISOString()}'`
-            : ""
-        }
-      `,
-
-      prisma.$queryRaw`
-        SELECT 
-          AVG(qa.percentage) as avg_quiz_score,
-          COUNT(CASE WHEN qa."isPassed" = true THEN 1 END) as passed_quizzes,
-          COUNT(qa.id) as total_quiz_attempts,
-          AVG(CASE WHEN asub.grade IS NOT NULL THEN asub.grade::float / asub.assignment."totalPoints" * 100 END) as avg_assignment_score
-        FROM "Enrollment" e
-        JOIN "Course" c ON e."courseId" = c.id
-        LEFT JOIN "QuizAttempt" qa ON qa."studentId" = e."studentId" AND qa.status = 'GRADED'
-        LEFT JOIN "AssignmentSubmission" asub ON asub."studentId" = e."studentId" AND asub.status = 'GRADED'
-        WHERE c."instructorId" = ${instructorId}
-        AND c.status = 'PUBLISHED'
-        ${courseId ? `AND c.id = '${courseId}'` : ""}
-      `,
-
-      prisma.$queryRaw`
-        SELECT 
-          CASE 
-            WHEN progress = 100 THEN 'Completed'
-            WHEN progress >= 75 THEN '75-99%'
-            WHEN progress >= 50 THEN '50-74%'
-            WHEN progress >= 25 THEN '25-49%'
-            WHEN progress > 0 THEN '1-24%'
-            ELSE 'Not Started'
-          END as progress_range,
-          COUNT(*) as student_count
-        FROM "Enrollment" e
-        JOIN "Course" c ON e."courseId" = c.id
-        WHERE c."instructorId" = ${instructorId}
-        AND c.status = 'PUBLISHED'
-        ${courseId ? `AND c.id = '${courseId}'` : ""}
-        GROUP BY progress_range
-        ORDER BY MIN(progress) DESC
-      `,
+      prisma.assignmentSubmission.aggregate({
+        where: {
+          student: {
+            enrollments: {
+              some: enrollmentWhere,
+            },
+          },
+          status: "GRADED",
+          grade: {
+            not: null,
+          },
+        },
+        _avg: {
+          grade: true,
+        },
+        _count: {
+          id: true,
+        },
+      }),
 
       prisma.enrollment.findMany({
         where: {
@@ -1857,44 +1847,100 @@ export const getStudentAnalytics = asyncHandler(async (req, res) => {
       }),
     ]);
 
-    const dailyActivity = await prisma.$queryRaw`
-      SELECT 
-        DATE(lc."completedAt") as activity_date,
-        COUNT(DISTINCT lc."studentId") as active_students,
-        COUNT(lc.id) as lesson_completions
-      FROM "LessonCompletion" lc
-      JOIN "Lesson" l ON lc."lessonId" = l.id
-      JOIN "Section" s ON l."sectionId" = s.id
-      JOIN "Course" c ON s."courseId" = c.id
-      WHERE c."instructorId" = ${instructorId}
-      AND c.status = 'PUBLISHED'
-      ${courseId ? `AND c.id = '${courseId}'` : ""}
-      AND lc."completedAt" >= ${
-        dateFilter.gte || new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
-      }
-      GROUP BY DATE(lc."completedAt")
-      ORDER BY activity_date DESC
-      LIMIT 30
-    `;
+    const progressDistribution = await prisma.enrollment.groupBy({
+      by: ["progress"],
+      where: {
+        course: courseWhere,
+      },
+      _count: {
+        id: true,
+      },
+    });
+
+    const progressRanges = progressDistribution.reduce((acc, item) => {
+      const progress = item.progress;
+      let range;
+
+      if (progress >= 100) range = "Completed";
+      else if (progress >= 75) range = "75-99%";
+      else if (progress >= 50) range = "50-74%";
+      else if (progress >= 25) range = "25-49%";
+      else if (progress > 0) range = "1-24%";
+      else range = "Not Started";
+
+      acc[range] = (acc[range] || 0) + item._count.id;
+      return acc;
+    }, {});
+
+    const lessonCompletions = await prisma.lessonCompletion.count({
+      where: {
+        lesson: {
+          section: {
+            course: courseWhere,
+          },
+        },
+        ...(Object.keys(dateFilter).length > 0 && { completedAt: dateFilter }),
+      },
+    });
+
+    const dailyActivityData = await prisma.lessonCompletion.groupBy({
+      by: ["completedAt"],
+      where: {
+        lesson: {
+          section: {
+            course: courseWhere,
+          },
+        },
+        completedAt: {
+          gte:
+            dateFilter.gte ||
+            new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
+        },
+      },
+      _count: {
+        studentId: true,
+        id: true,
+      },
+    });
+
+    const dailyActivity = dailyActivityData
+      .map((activity) => ({
+        date: activity.completedAt.toISOString().split("T")[0],
+        activeStudents: activity._count.studentId,
+        lessonCompletions: activity._count.id,
+      }))
+      .slice(0, 30);
+
+    const halfwayStudents = await prisma.enrollment.count({
+      where: {
+        ...enrollmentWhere,
+        progress: {
+          gte: 50,
+        },
+      },
+    });
+
+    const passedQuizzes = await prisma.quizAttempt.count({
+      where: {
+        student: {
+          enrollments: {
+            some: enrollmentWhere,
+          },
+        },
+        isPassed: true,
+      },
+    });
 
     const result = {
       overview: {
-        totalEnrollments: enrollmentStats.reduce(
-          (acc, curr) => acc + curr._count.id,
-          0
-        ),
-        activeStudents: engagementStats[0]?.active_learners || 0,
+        totalEnrollments: totalEnrollments,
+        activeStudents: engagementData._count.id,
         completionRate:
-          completionStats[0]?.completed_students &&
-          completionStats[0]?.total_students
-            ? (
-                (Number(completionStats[0].completed_students) /
-                  Number(completionStats[0].total_students)) *
-                100
-              ).toFixed(1)
+          totalEnrollments > 0
+            ? ((completedEnrollments / totalEnrollments) * 100).toFixed(1)
             : "0",
-        averageProgress: completionStats[0]?.average_progress
-          ? Number(completionStats[0].average_progress).toFixed(1)
+        averageProgress: engagementData._avg.progress
+          ? Number(engagementData._avg.progress).toFixed(1)
           : "0",
       },
       enrollmentBreakdown: enrollmentStats.map((stat) => ({
@@ -1902,45 +1948,40 @@ export const getStudentAnalytics = asyncHandler(async (req, res) => {
         count: stat._count.id,
       })),
       completion: {
-        totalStudents: Number(completionStats[0]?.total_students || 0),
-        completedStudents: Number(completionStats[0]?.completed_students || 0),
-        halfwayStudents: Number(completionStats[0]?.halfway_students || 0),
-        averageProgress: Number(
-          completionStats[0]?.average_progress || 0
-        ).toFixed(1),
+        totalStudents: totalEnrollments,
+        completedStudents: completedEnrollments,
+        halfwayStudents: halfwayStudents,
+        averageProgress: engagementData._avg.progress
+          ? Number(engagementData._avg.progress).toFixed(1)
+          : "0",
       },
       engagement: {
-        activeLearners: Number(engagementStats[0]?.active_learners || 0),
-        totalLessonCompletions: Number(
-          engagementStats[0]?.total_lesson_completions || 0
-        ),
-        averageLessonTime: Number(
-          engagementStats[0]?.avg_lesson_time || 0
-        ).toFixed(0),
-        quizAttempts: Number(engagementStats[0]?.quiz_attempts || 0),
-        assignmentSubmissions: Number(
-          engagementStats[0]?.assignment_submissions || 0
-        ),
+        activeLearners: engagementData._count.id,
+        totalLessonCompletions: lessonCompletions,
+        averageLessonTime: engagementData._avg.totalTimeSpent
+          ? Number(engagementData._avg.totalTimeSpent).toFixed(0)
+          : "0",
+        quizAttempts: quizStats._count.id,
+        assignmentSubmissions: assignmentStats._count.id,
       },
       performance: {
-        averageQuizScore: Number(
-          performanceStats[0]?.avg_quiz_score || 0
-        ).toFixed(1),
-        quizPassRate: performanceStats[0]?.total_quiz_attempts
-          ? (
-              (Number(performanceStats[0].passed_quizzes) /
-                Number(performanceStats[0].total_quiz_attempts)) *
-              100
-            ).toFixed(1)
+        averageQuizScore: quizStats._avg.percentage
+          ? Number(quizStats._avg.percentage).toFixed(1)
           : "0",
-        averageAssignmentScore: Number(
-          performanceStats[0]?.avg_assignment_score || 0
-        ).toFixed(1),
+        quizPassRate:
+          quizStats._count.id > 0
+            ? ((passedQuizzes / quizStats._count.id) * 100).toFixed(1)
+            : "0",
+        averageAssignmentScore: assignmentStats._avg.grade
+          ? Number(assignmentStats._avg.grade).toFixed(1)
+          : "0",
       },
-      progressDistribution: progressDistribution.map((dist) => ({
-        range: dist.progress_range,
-        count: Number(dist.student_count),
-      })),
+      progressDistribution: Object.entries(progressRanges).map(
+        ([range, count]) => ({
+          range,
+          count,
+        })
+      ),
       topPerformers: topPerformers.map((enrollment) => ({
         studentId: enrollment.student.id,
         name: `${enrollment.student.user.firstName} ${enrollment.student.user.lastName}`,
@@ -1964,11 +2005,7 @@ export const getStudentAnalytics = asyncHandler(async (req, res) => {
             )
           : null,
       })),
-      dailyActivity: dailyActivity.map((activity) => ({
-        date: activity.activity_date,
-        activeStudents: Number(activity.active_students),
-        lessonCompletions: Number(activity.lesson_completions),
-      })),
+      dailyActivity: dailyActivity,
       timeframe,
       generatedAt: new Date().toISOString(),
     };
@@ -2749,7 +2786,8 @@ export const exportStudentData = asyncHandler(async (req, res) => {
 
 export const getStudentEngagement = asyncHandler(async (req, res) => {
   const instructorId = req.instructorProfile.id;
-  const { courseId, timeframe = "month" } = req.query;
+  const { courseId } = req.params;
+  const { timeframe = "month" } = req.query;
 
   try {
     const cacheKey = `instructor:${instructorId}:engagement:${
@@ -2770,196 +2808,232 @@ export const getStudentEngagement = asyncHandler(async (req, res) => {
     }
 
     const now = new Date();
-    let dateFilter = {};
+    let dateFilter = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
     if (timeframe === "week") {
-      dateFilter.gte = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    } else if (timeframe === "month") {
-      dateFilter.gte = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      dateFilter = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     } else if (timeframe === "quarter") {
-      dateFilter.gte = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+      dateFilter = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
     }
 
-    const courseWhere = {
+    const baseWhere = {
       instructorId,
       status: "PUBLISHED",
       ...(courseId && { id: courseId }),
     };
 
+    const enrollmentWhere = {
+      course: baseWhere,
+    };
+
     const [
-      overallEngagement,
-      contentEngagement,
-      communityEngagement,
-      timeBasedEngagement,
+      enrollments,
+      lessonCompletions,
+      quizAttempts,
+      assignmentSubmissions,
+      reviews,
+      qnaQuestions,
     ] = await Promise.all([
-      prisma.$queryRaw`
-        SELECT 
-          COUNT(DISTINCT e."studentId") as total_enrolled,
-          COUNT(DISTINCT CASE WHEN e."lastAccessedAt" >= ${
-            dateFilter.gte || new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
-          } THEN e."studentId" END) as active_students,
-          AVG(e.progress) as avg_progress,
-          COUNT(DISTINCT CASE WHEN e.progress = 100 THEN e."studentId" END) as completed_students,
-          AVG(e."totalTimeSpent") as avg_time_spent
-        FROM "Enrollment" e
-        JOIN "Course" c ON e."courseId" = c.id
-        WHERE c."instructorId" = ${instructorId}
-        AND c.status = 'PUBLISHED'
-        ${courseId ? `AND c.id = '${courseId}'` : ""}
-      `,
-
-      prisma.$queryRaw`
-        SELECT 
-          COUNT(DISTINCT lc.id) as lesson_completions,
-          COUNT(DISTINCT qa.id) as quiz_attempts,
-          COUNT(DISTINCT asub.id) as assignment_submissions,
-          AVG(lc."timeSpent") as avg_lesson_time,
-          COUNT(DISTINCT lc."studentId") as students_completing_lessons,
-          COUNT(DISTINCT qa."studentId") as students_taking_quizzes,
-          COUNT(DISTINCT asub."studentId") as students_submitting_assignments
-        FROM "Course" c
-        LEFT JOIN "Section" s ON s."courseId" = c.id
-        LEFT JOIN "Lesson" l ON l."sectionId" = s.id
-        LEFT JOIN "LessonCompletion" lc ON lc."lessonId" = l.id 
-          ${
-            Object.keys(dateFilter).length > 0
-              ? `AND lc."completedAt" >= '${dateFilter.gte.toISOString()}'`
-              : ""
-          }
-        LEFT JOIN "Quiz" q ON q."sectionId" = s.id
-        LEFT JOIN "QuizAttempt" qa ON qa."quizId" = q.id
-          ${
-            Object.keys(dateFilter).length > 0
-              ? `AND qa."startedAt" >= '${dateFilter.gte.toISOString()}'`
-              : ""
-          }
-        LEFT JOIN "Assignment" a ON a."sectionId" = s.id
-        LEFT JOIN "AssignmentSubmission" asub ON asub."assignmentId" = a.id
-          ${
-            Object.keys(dateFilter).length > 0
-              ? `AND asub."submittedAt" >= '${dateFilter.gte.toISOString()}'`
-              : ""
-          }
-        WHERE c."instructorId" = ${instructorId}
-        AND c.status = 'PUBLISHED'
-        ${courseId ? `AND c.id = '${courseId}'` : ""}
-      `,
-
-      prisma.$queryRaw`
-        SELECT 
-          COUNT(DISTINCT r.id) as reviews_written,
-          COUNT(DISTINCT q.id) as questions_asked,
-          COUNT(DISTINCT rr.id) as review_replies,
-          AVG(r.rating) as avg_rating
-        FROM "Course" c
-        LEFT JOIN "Review" r ON r."courseId" = c.id 
-          ${
-            Object.keys(dateFilter).length > 0
-              ? `AND r."createdAt" >= '${dateFilter.gte.toISOString()}'`
-              : ""
-          }
-        LEFT JOIN "QnAQuestion" q ON q."courseId" = c.id
-          ${
-            Object.keys(dateFilter).length > 0
-              ? `AND q."createdAt" >= '${dateFilter.gte.toISOString()}'`
-              : ""
-          }
-        LEFT JOIN "ReviewReply" rr ON rr."reviewId" = r.id
-          ${
-            Object.keys(dateFilter).length > 0
-              ? `AND rr."createdAt" >= '${dateFilter.gte.toISOString()}'`
-              : ""
-          }
-        WHERE c."instructorId" = ${instructorId}
-        AND c.status = 'PUBLISHED'
-        ${courseId ? `AND c.id = '${courseId}'` : ""}
-      `,
-
-      prisma.$queryRaw`
-        SELECT 
-          DATE(lc."completedAt") as activity_date,
-          COUNT(DISTINCT lc."studentId") as unique_active_students,
-          COUNT(lc.id) as lesson_completions,
-          COUNT(DISTINCT qa.id) as quiz_attempts,
-          COUNT(DISTINCT asub.id) as assignment_submissions
-        FROM "LessonCompletion" lc
-        JOIN "Lesson" l ON lc."lessonId" = l.id
-        JOIN "Section" s ON l."sectionId" = s.id
-        JOIN "Course" c ON s."courseId" = c.id
-        LEFT JOIN "QuizAttempt" qa ON qa."studentId" = lc."studentId" 
-          AND DATE(qa."startedAt") = DATE(lc."completedAt")
-        LEFT JOIN "AssignmentSubmission" asub ON asub."studentId" = lc."studentId"
-          AND DATE(asub."submittedAt") = DATE(lc."completedAt")
-        WHERE c."instructorId" = ${instructorId}
-        AND c.status = 'PUBLISHED'
-        ${courseId ? `AND c.id = '${courseId}'` : ""}
-        AND lc."completedAt" >= ${
-          dateFilter.gte || new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
-        }
-        GROUP BY DATE(lc."completedAt")
-        ORDER BY activity_date DESC
-        LIMIT 30
-      `,
+      prisma.enrollment.findMany({
+        where: enrollmentWhere,
+        select: {
+          studentId: true,
+          progress: true,
+          totalTimeSpent: true,
+          lastAccessedAt: true,
+        },
+      }),
+      prisma.lessonCompletion.findMany({
+        where: {
+          lesson: {
+            section: {
+              course: baseWhere,
+            },
+          },
+          completedAt: {
+            gte: dateFilter,
+          },
+        },
+        select: {
+          studentId: true,
+          timeSpent: true,
+          completedAt: true,
+        },
+      }),
+      prisma.quizAttempt.findMany({
+        where: {
+          quiz: {
+            section: {
+              course: baseWhere,
+            },
+          },
+          startedAt: {
+            gte: dateFilter,
+          },
+        },
+        select: {
+          studentId: true,
+          startedAt: true,
+        },
+      }),
+      prisma.assignmentSubmission.findMany({
+        where: {
+          assignment: {
+            section: {
+              course: baseWhere,
+            },
+          },
+          submittedAt: {
+            gte: dateFilter,
+          },
+        },
+        select: {
+          studentId: true,
+          submittedAt: true,
+        },
+      }),
+      prisma.review.findMany({
+        where: {
+          course: baseWhere,
+          createdAt: {
+            gte: dateFilter,
+          },
+        },
+        select: {
+          rating: true,
+          createdAt: true,
+        },
+      }),
+      prisma.qnAQuestion.findMany({
+        where: {
+          course: baseWhere,
+          createdAt: {
+            gte: dateFilter,
+          },
+        },
+        select: {
+          createdAt: true,
+        },
+      }),
     ]);
+
+    const activeStudents = new Set();
+    enrollments.forEach((enrollment) => {
+      if (
+        enrollment.lastAccessedAt &&
+        enrollment.lastAccessedAt >= dateFilter
+      ) {
+        activeStudents.add(enrollment.studentId);
+      }
+    });
+
+    const completedStudents = enrollments.filter(
+      (e) => e.progress === 100
+    ).length;
+    const totalTimeSpent = enrollments.reduce(
+      (sum, e) => sum + (e.totalTimeSpent || 0),
+      0
+    );
+    const avgProgress =
+      enrollments.length > 0
+        ? enrollments.reduce((sum, e) => sum + (e.progress || 0), 0) /
+          enrollments.length
+        : 0;
+
+    const avgLessonTime =
+      lessonCompletions.length > 0
+        ? lessonCompletions.reduce((sum, lc) => sum + (lc.timeSpent || 0), 0) /
+          lessonCompletions.length
+        : 0;
+
+    const studentsCompletingLessons = new Set(
+      lessonCompletions.map((lc) => lc.studentId)
+    ).size;
+    const studentsTakingQuizzes = new Set(
+      quizAttempts.map((qa) => qa.studentId)
+    ).size;
+    const studentsSubmittingAssignments = new Set(
+      assignmentSubmissions.map((as) => as.studentId)
+    ).size;
+
+    const avgRating =
+      reviews.length > 0
+        ? reviews.reduce((sum, r) => sum + r.rating, 0) / reviews.length
+        : 0;
+
+    const dailyActivityMap = new Map();
+
+    lessonCompletions.forEach((lc) => {
+      const date = lc.completedAt.toISOString().split("T")[0];
+      if (!dailyActivityMap.has(date)) {
+        dailyActivityMap.set(date, {
+          date,
+          students: new Set(),
+          lessonCompletions: 0,
+          quizAttempts: 0,
+          assignmentSubmissions: 0,
+        });
+      }
+      const activity = dailyActivityMap.get(date);
+      activity.students.add(lc.studentId);
+      activity.lessonCompletions++;
+    });
+
+    quizAttempts.forEach((qa) => {
+      const date = qa.startedAt.toISOString().split("T")[0];
+      if (dailyActivityMap.has(date)) {
+        dailyActivityMap.get(date).quizAttempts++;
+      }
+    });
+
+    assignmentSubmissions.forEach((as) => {
+      const date = as.submittedAt.toISOString().split("T")[0];
+      if (dailyActivityMap.has(date)) {
+        dailyActivityMap.get(date).assignmentSubmissions++;
+      }
+    });
+
+    const dailyActivity = Array.from(dailyActivityMap.values())
+      .map((activity) => ({
+        date: activity.date,
+        uniqueActiveStudents: activity.students.size,
+        lessonCompletions: activity.lessonCompletions,
+        quizAttempts: activity.quizAttempts,
+        assignmentSubmissions: activity.assignmentSubmissions,
+      }))
+      .sort((a, b) => new Date(b.date) - new Date(a.date))
+      .slice(0, 30);
 
     const result = {
       summary: {
-        totalEnrolled: Number(overallEngagement[0]?.total_enrolled || 0),
-        activeStudents: Number(overallEngagement[0]?.active_students || 0),
-        averageProgress: Number(
-          overallEngagement[0]?.avg_progress || 0
-        ).toFixed(1),
-        completedStudents: Number(
-          overallEngagement[0]?.completed_students || 0
+        totalEnrolled: enrollments.length,
+        activeStudents: activeStudents.size,
+        averageProgress: avgProgress.toFixed(1),
+        completedStudents,
+        averageTimeSpent: Math.round(
+          totalTimeSpent / Math.max(enrollments.length, 1)
         ),
-        averageTimeSpent: Number(
-          overallEngagement[0]?.avg_time_spent || 0
-        ).toFixed(0),
         engagementRate:
-          overallEngagement[0]?.total_enrolled > 0
-            ? (
-                (Number(overallEngagement[0].active_students) /
-                  Number(overallEngagement[0].total_enrolled)) *
-                100
-              ).toFixed(1)
+          enrollments.length > 0
+            ? ((activeStudents.size / enrollments.length) * 100).toFixed(1)
             : "0",
       },
       contentEngagement: {
-        lessonCompletions: Number(
-          contentEngagement[0]?.lesson_completions || 0
-        ),
-        quizAttempts: Number(contentEngagement[0]?.quiz_attempts || 0),
-        assignmentSubmissions: Number(
-          contentEngagement[0]?.assignment_submissions || 0
-        ),
-        averageLessonTime: Number(
-          contentEngagement[0]?.avg_lesson_time || 0
-        ).toFixed(0),
-        studentsCompletingLessons: Number(
-          contentEngagement[0]?.students_completing_lessons || 0
-        ),
-        studentsTakingQuizzes: Number(
-          contentEngagement[0]?.students_taking_quizzes || 0
-        ),
-        studentsSubmittingAssignments: Number(
-          contentEngagement[0]?.students_submitting_assignments || 0
-        ),
+        lessonCompletions: lessonCompletions.length,
+        quizAttempts: quizAttempts.length,
+        assignmentSubmissions: assignmentSubmissions.length,
+        averageLessonTime: Math.round(avgLessonTime),
+        studentsCompletingLessons,
+        studentsTakingQuizzes,
+        studentsSubmittingAssignments,
       },
       communityEngagement: {
-        reviewsWritten: Number(communityEngagement[0]?.reviews_written || 0),
-        questionsAsked: Number(communityEngagement[0]?.questions_asked || 0),
-        reviewReplies: Number(communityEngagement[0]?.review_replies || 0),
-        averageRating: Number(communityEngagement[0]?.avg_rating || 0).toFixed(
-          1
-        ),
+        reviewsWritten: reviews.length,
+        questionsAsked: qnaQuestions.length,
+        reviewReplies: 0,
+        averageRating: avgRating.toFixed(1),
       },
-      dailyActivity: timeBasedEngagement.map((day) => ({
-        date: day.activity_date,
-        uniqueActiveStudents: Number(day.unique_active_students),
-        lessonCompletions: Number(day.lesson_completions),
-        quizAttempts: Number(day.quiz_attempts),
-        assignmentSubmissions: Number(day.assignment_submissions),
-      })),
+      dailyActivity,
       timeframe,
       generatedAt: new Date().toISOString(),
     };

@@ -8,7 +8,6 @@ import {
   getCourseQnA,
   askQuestion,
   incrementQuestionViews,
-  reportContent,
 } from "../../controllers/student/community.controller.js";
 import { isLoggedIn } from "../../middlewares/middleware.js";
 
@@ -29,7 +28,5 @@ router.get("/courses/:courseId/qna", getCourseQnA);
 router.post("/courses/:courseId/qna", isLoggedIn, askQuestion);
 
 router.post("/questions/:questionId/views", isLoggedIn, incrementQuestionViews);
-
-router.post("/report", isLoggedIn, reportContent);
 
 export default router;

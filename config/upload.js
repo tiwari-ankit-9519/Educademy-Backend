@@ -29,12 +29,17 @@ const storage = new CloudinaryStorage({
       folder = "educademy/courses";
     } else if (req.route?.path?.includes("lesson")) {
       folder = "educademy/lessons";
+    } else if (req.route?.path?.includes("assignment")) {
+      folder = file.mimetype.startsWith("image/")
+        ? "educademy/assignments/images"
+        : "educademy/assignments/documents";
+    } else if (req.route?.path?.includes("verification")) {
+      folder = "educademy/verification";
     }
 
     return {
       folder,
       allowed_formats: [
-        // Images
         "jpg",
         "jpeg",
         "png",
@@ -43,7 +48,6 @@ const storage = new CloudinaryStorage({
         "bmp",
         "tiff",
         "svg",
-        // Videos
         "mp4",
         "avi",
         "mov",
@@ -53,17 +57,19 @@ const storage = new CloudinaryStorage({
         "mkv",
         "m4v",
         "3gp",
-        // Audio
         "mp3",
         "wav",
         "aac",
         "ogg",
         "flac",
         "m4a",
-        // Documents
         "pdf",
         "doc",
         "docx",
+        "ppt",
+        "pptx",
+        "xls",
+        "xlsx",
         "txt",
         "rtf",
       ],
@@ -81,7 +87,6 @@ const storage = new CloudinaryStorage({
         ],
       }),
 
-      // Image-specific configurations
       ...(file.mimetype.startsWith("image/") && {
         transformation: [
           {
@@ -94,16 +99,13 @@ const storage = new CloudinaryStorage({
   },
 });
 
-// General upload middleware
 const upload = multer({
   storage,
   limits: {
-    fileSize: 100 * 1024 * 1024, // 100MB limit (adjust as needed)
+    fileSize: 100 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
-    // Define allowed MIME types
     const allowedTypes = [
-      // Images
       "image/jpeg",
       "image/jpg",
       "image/png",
@@ -112,7 +114,6 @@ const upload = multer({
       "image/bmp",
       "image/tiff",
       "image/svg+xml",
-      // Videos
       "video/mp4",
       "video/avi",
       "video/quicktime",
@@ -121,17 +122,18 @@ const upload = multer({
       "video/webm",
       "video/x-matroska",
       "video/3gpp",
-      // Audio
       "audio/mpeg",
       "audio/wav",
       "audio/aac",
       "audio/ogg",
       "audio/flac",
       "audio/mp4",
-      // Documents
       "application/pdf",
       "application/msword",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "application/vnd.ms-excel",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       "text/plain",
       "application/rtf",
     ];
@@ -144,11 +146,10 @@ const upload = multer({
   },
 });
 
-// Specific upload middlewares for different use cases
 export const uploadImage = multer({
   storage,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB for images
+    fileSize: 10 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith("image/")) {
@@ -162,7 +163,7 @@ export const uploadImage = multer({
 export const uploadVideo = multer({
   storage,
   limits: {
-    fileSize: 500 * 1024 * 1024, // 500MB for videos
+    fileSize: 500 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith("video/")) {
@@ -176,7 +177,7 @@ export const uploadVideo = multer({
 export const uploadAudio = multer({
   storage,
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB for audio
+    fileSize: 50 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith("audio/")) {
@@ -190,7 +191,7 @@ export const uploadAudio = multer({
 export const uploadDocument = multer({
   storage,
   limits: {
-    fileSize: 25 * 1024 * 1024, // 25MB for documents
+    fileSize: 25 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
     const allowedTypes = [
@@ -212,10 +213,45 @@ export const uploadDocument = multer({
   },
 });
 
+export const uploadAssignmentResources = multer({
+  storage,
+  limits: {
+    fileSize: 50 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      "application/pdf",
+      "application/msword",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "application/vnd.ms-excel",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "text/plain",
+      "application/rtf",
+      "image/jpeg",
+      "image/jpg",
+      "image/png",
+      "image/gif",
+      "image/webp",
+    ];
+
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(
+        new Error(
+          "Only document and image files are allowed for assignment resources"
+        ),
+        false
+      );
+    }
+  },
+});
+
 export const uploadCourseMedia = multer({
   storage,
   limits: {
-    fileSize: 500 * 1024 * 1024, // 500MB
+    fileSize: 500 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
     const allowedTypes = [
@@ -241,11 +277,9 @@ export const uploadCourseMedia = multer({
   },
 });
 
-// ✅ FIXED: Helper function to determine resource type from MIME type and publicId
 const getResourceType = (publicId, mimeType = null) => {
   const lowerPublicId = publicId.toLowerCase();
 
-  // If we have MIME type, use it for more accurate detection
   if (mimeType) {
     if (mimeType.startsWith("image/")) {
       return "image";
@@ -254,14 +288,13 @@ const getResourceType = (publicId, mimeType = null) => {
       return "video";
     }
     if (mimeType.startsWith("audio/")) {
-      return "video"; // Cloudinary treats audio as video resource type
+      return "video";
     }
     if (mimeType.startsWith("application/") || mimeType.startsWith("text/")) {
       return "raw";
     }
   }
 
-  // Fallback to file extension detection
   if (lowerPublicId.match(/\.(jpg|jpeg|png|gif|webp|bmp|tiff|svg)$/)) {
     return "image";
   }
@@ -271,14 +304,13 @@ const getResourceType = (publicId, mimeType = null) => {
   }
 
   if (lowerPublicId.match(/\.(mp3|wav|aac|ogg|flac|m4a)$/)) {
-    return "video"; // Cloudinary treats audio as video resource type
+    return "video";
   }
 
-  if (lowerPublicId.match(/\.(pdf|doc|docx|txt|rtf)$/)) {
+  if (lowerPublicId.match(/\.(pdf|doc|docx|ppt|pptx|xls|xlsx|txt|rtf)$/)) {
     return "raw";
   }
 
-  // Check by folder structure
   if (
     lowerPublicId.includes("/profiles/") ||
     lowerPublicId.includes("/images/")
@@ -291,25 +323,25 @@ const getResourceType = (publicId, mimeType = null) => {
   }
 
   if (lowerPublicId.includes("/audio/")) {
-    return "video"; // Cloudinary treats audio as video resource type
+    return "video";
   }
 
-  if (lowerPublicId.includes("/documents/")) {
+  if (
+    lowerPublicId.includes("/documents/") ||
+    lowerPublicId.includes("/assignments/")
+  ) {
     return "raw";
   }
 
-  // Default fallback
   return "image";
 };
 
-// ✅ COMPLETELY REWRITTEN: Enhanced deleteFromCloudinary function
 export const deleteFromCloudinary = async (
   publicId,
   resourceType = null,
   mimeType = null
 ) => {
   try {
-    // Determine the resource type if not provided
     const finalResourceType =
       resourceType || getResourceType(publicId, mimeType);
 
@@ -323,7 +355,6 @@ export const deleteFromCloudinary = async (
 
     console.log(`Cloudinary deletion result:`, result);
 
-    // If deletion was unsuccessful, try other resource types
     if (result.result !== "ok" && !resourceType) {
       const alternativeTypes = ["image", "video", "raw"].filter(
         (type) => type !== finalResourceType

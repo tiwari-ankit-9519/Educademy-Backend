@@ -25,9 +25,9 @@ const router = express.Router();
 
 router.use(requireInstructor);
 
-router.get("/", getEnrolledStudents);
-router.get("/analytics", getStudentAnalytics);
-router.get("/engagement", getStudentEngagement);
+router.get("/:courseId", getEnrolledStudents);
+router.get("/:courseId/analytics", getStudentAnalytics);
+router.get("/:courseId/engagement", getStudentEngagement);
 router.get("/pending-grading", getPendingGrading);
 router.get("/export", exportStudentData);
 router.post("/announcements", announceToStudents);

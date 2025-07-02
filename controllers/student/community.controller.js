@@ -44,7 +44,7 @@ export const getCourseReviews = asyncHandler(async (req, res) => {
 
     const cacheKey = generateCacheKey("course_reviews", {
       courseId,
-      userId: req.userAuthId || "anonymous",
+      userId: req.userAuthId,
       page,
       limit,
       sortBy,
@@ -165,26 +165,24 @@ export const getCourseReviews = asyncHandler(async (req, res) => {
       }),
     ]);
 
-    const currentUserReview = req.userAuthId
-      ? await prisma.review.findUnique({
-          where: {
-            authorId_courseId: {
-              authorId: req.userAuthId,
-              courseId: courseId,
-            },
+    const currentUserReview = await prisma.review.findUnique({
+      where: {
+        authorId_courseId: {
+          authorId: req.userAuthId,
+          courseId: courseId,
+        },
+      },
+      include: {
+        author: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            profileImage: true,
           },
-          include: {
-            author: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                profileImage: true,
-              },
-            },
-          },
-        })
-      : null;
+        },
+      },
+    });
 
     const ratingDistribution = [5, 4, 3, 2, 1].map((rating) => {
       const stat = ratingStats.find((s) => s.rating === rating);
@@ -899,7 +897,7 @@ export const getCourseQnA = asyncHandler(async (req, res) => {
 
     const cacheKey = generateCacheKey("course_qna", {
       courseId,
-      userId: req.userAuthId || "anonymous",
+      userId: req.userAuthId,
       page,
       limit,
       sortBy,
@@ -1029,16 +1027,14 @@ export const getCourseQnA = asyncHandler(async (req, res) => {
       prisma.qnAQuestion.count({ where }),
     ]);
 
-    const isEnrolled = req.userAuthId
-      ? await prisma.enrollment.findUnique({
-          where: {
-            studentId_courseId: {
-              studentId: req.userAuthId,
-              courseId: courseId,
-            },
-          },
-        })
-      : null;
+    const isEnrolled = await prisma.enrollment.findUnique({
+      where: {
+        studentId_courseId: {
+          studentId: req.userAuthId,
+          courseId: courseId,
+        },
+      },
+    });
 
     const result = {
       course: {
@@ -1235,13 +1231,9 @@ export const askQuestion = asyncHandler(async (req, res) => {
       }
     }
 
-    const student = await prisma.student.findUnique({
-      where: { userId: req.userAuthId },
-    });
-
     const question = await prisma.qnAQuestion.create({
       data: {
-        studentId: student.id,
+        studentId: req.studentProfile.id,
         courseId: courseId,
         lessonId: lessonId || null,
         title: title.trim(),
@@ -1431,166 +1423,6 @@ export const incrementQuestionViews = asyncHandler(async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to increment views",
-      code: "INTERNAL_SERVER_ERROR",
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
-});
-
-export const reportContent = asyncHandler(async (req, res) => {
-  const requestId = generateRequestId();
-  const startTime = performance.now();
-
-  try {
-    const { contentType, contentId, reason, description } = req.body;
-
-    if (
-      !["REVIEW", "REVIEW_REPLY", "QNA_QUESTION", "QNA_ANSWER"].includes(
-        contentType
-      )
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid content type",
-        code: "INVALID_CONTENT_TYPE",
-      });
-    }
-
-    if (!contentId || !reason) {
-      return res.status(400).json({
-        success: false,
-        message: "Content ID and reason are required",
-        code: "MISSING_REQUIRED_FIELDS",
-      });
-    }
-
-    const validReasons = [
-      "spam",
-      "harassment",
-      "inappropriate_content",
-      "false_information",
-      "copyright_violation",
-      "other",
-    ];
-
-    if (!validReasons.includes(reason)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid report reason",
-        code: "INVALID_REASON",
-      });
-    }
-
-    let contentExists = false;
-    let contentTitle = "";
-
-    switch (contentType) {
-      case "REVIEW":
-        const review = await prisma.review.findUnique({
-          where: { id: contentId },
-          select: { id: true, title: true },
-        });
-        contentExists = !!review;
-        contentTitle = review?.title || "";
-        break;
-      case "REVIEW_REPLY":
-        const reply = await prisma.reviewReply.findUnique({
-          where: { id: contentId },
-          select: { id: true, content: true },
-        });
-        contentExists = !!reply;
-        contentTitle = reply?.content?.substring(0, 50) + "..." || "";
-        break;
-      case "QNA_QUESTION":
-        const question = await prisma.qnAQuestion.findUnique({
-          where: { id: contentId },
-          select: { id: true, title: true },
-        });
-        contentExists = !!question;
-        contentTitle = question?.title || "";
-        break;
-      case "QNA_ANSWER":
-        const answer = await prisma.qnAAnswer.findUnique({
-          where: { id: contentId },
-          select: { id: true, content: true },
-        });
-        contentExists = !!answer;
-        contentTitle = answer?.content?.substring(0, 50) + "..." || "";
-        break;
-    }
-
-    if (!contentExists) {
-      return res.status(404).json({
-        success: false,
-        message: "Content not found",
-        code: "CONTENT_NOT_FOUND",
-      });
-    }
-
-    const existingReport = await prisma.contentReport.findFirst({
-      where: {
-        contentType,
-        contentId,
-        reportedById: req.userAuthId,
-      },
-    });
-
-    if (existingReport) {
-      return res.status(400).json({
-        success: false,
-        message: "You have already reported this content",
-        code: "ALREADY_REPORTED",
-      });
-    }
-
-    const report = await prisma.contentReport.create({
-      data: {
-        contentType,
-        contentId,
-        reason,
-        description: description?.trim() || null,
-        reportedById: req.userAuthId,
-      },
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(201).json({
-      success: true,
-      message: "Content reported successfully",
-      data: {
-        report: {
-          id: report.id,
-          contentType: report.contentType,
-          contentId: report.contentId,
-          reason: report.reason,
-          description: report.description,
-          status: report.status,
-          createdAt: report.createdAt,
-        },
-      },
-      meta: {
-        requestId,
-        executionTime: Math.round(executionTime),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error(`REPORT_CONTENT_ERROR [${requestId}]:`, {
-      error: error.message,
-      stack: error.stack,
-      userId: req.userAuthId,
-    });
-
-    const executionTime = performance.now() - startTime;
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to report content",
       code: "INTERNAL_SERVER_ERROR",
       meta: {
         requestId,

@@ -74,7 +74,7 @@ export const getEnrolledCourses = asyncHandler(async (req, res) => {
     const skip = (pageNumber - 1) * pageSize;
 
     const where = {
-      studentId: req.userAuthId,
+      studentId: req.studentProfile.id,
     };
 
     if (status && status !== "ALL") {
@@ -289,7 +289,7 @@ export const getCourseContent = asyncHandler(async (req, res) => {
     const enrollment = await prisma.enrollment.findUnique({
       where: {
         studentId_courseId: {
-          studentId: req.userAuthId,
+          studentId: req.studentProfile.id,
           courseId: courseId,
         },
       },
@@ -316,7 +316,7 @@ export const getCourseContent = asyncHandler(async (req, res) => {
                   orderBy: { order: "asc" },
                   include: {
                     completions: {
-                      where: { studentId: req.userAuthId },
+                      where: { studentId: req.studentProfile.id },
                     },
                     attachments: true,
                     bookmarks: {
@@ -328,7 +328,7 @@ export const getCourseContent = asyncHandler(async (req, res) => {
                   orderBy: { order: "asc" },
                   include: {
                     attempts: {
-                      where: { studentId: req.userAuthId },
+                      where: { studentId: req.studentProfile.id },
                       orderBy: { attemptNumber: "desc" },
                       take: 1,
                     },
@@ -341,7 +341,7 @@ export const getCourseContent = asyncHandler(async (req, res) => {
                   orderBy: { order: "asc" },
                   include: {
                     submissions: {
-                      where: { studentId: req.userAuthId },
+                      where: { studentId: req.studentProfile.id },
                       orderBy: { createdAt: "desc" },
                       take: 1,
                     },
@@ -604,7 +604,7 @@ export const accessLesson = asyncHandler(async (req, res) => {
             course: {
               include: {
                 enrollments: {
-                  where: { studentId: req.userAuthId },
+                  where: { studentId: req.studentProfile.id },
                 },
                 instructor: {
                   include: {
@@ -622,7 +622,7 @@ export const accessLesson = asyncHandler(async (req, res) => {
           },
         },
         completions: {
-          where: { studentId: req.userAuthId },
+          where: { studentId: req.studentProfile.id },
         },
         attachments: true,
         notes: {
@@ -636,7 +636,7 @@ export const accessLesson = asyncHandler(async (req, res) => {
         postLessonQuiz: {
           include: {
             attempts: {
-              where: { studentId: req.userAuthId },
+              where: { studentId: req.studentProfile.id },
               orderBy: { attemptNumber: "desc" },
               take: 1,
             },
@@ -680,7 +680,10 @@ export const accessLesson = asyncHandler(async (req, res) => {
 
     const isCompleted = lesson.completions.length > 0;
     const completion = lesson.completions[0];
-    const navigation = await getLessonNavigation(lessonId, req.userAuthId);
+    const navigation = await getLessonNavigation(
+      lessonId,
+      req.studentProfile.id
+    );
 
     const result = {
       lesson: {
@@ -801,7 +804,7 @@ export const completeLesson = asyncHandler(async (req, res) => {
 
   try {
     const { lessonId } = req.params;
-    const { timeSpent, watchTime, watchProgress } = req.body;
+    const { timeSpent, watchTime } = req.body;
 
     const lesson = await prisma.lesson.findUnique({
       where: { id: lessonId },
@@ -811,7 +814,7 @@ export const completeLesson = asyncHandler(async (req, res) => {
             course: {
               include: {
                 enrollments: {
-                  where: { studentId: req.userAuthId },
+                  where: { studentId: req.studentProfile.id },
                 },
               },
             },
@@ -841,7 +844,7 @@ export const completeLesson = asyncHandler(async (req, res) => {
     const existingCompletion = await prisma.lessonCompletion.findUnique({
       where: {
         studentId_lessonId: {
-          studentId: req.userAuthId,
+          studentId: req.studentProfile.id,
           lessonId: lessonId,
         },
       },
@@ -865,7 +868,7 @@ export const completeLesson = asyncHandler(async (req, res) => {
     } else {
       completion = await prisma.lessonCompletion.create({
         data: {
-          studentId: req.userAuthId,
+          studentId: req.studentProfile.id,
           lessonId: lessonId,
           timeSpent: timeSpent || 0,
           watchTime: watchTime || 0,
@@ -882,10 +885,10 @@ export const completeLesson = asyncHandler(async (req, res) => {
       });
     }
 
-    await updateCourseProgress(req.userAuthId, lesson.section.course.id);
+    await updateCourseProgress(req.studentProfile.id, lesson.section.course.id);
 
     const progressData = await getCourseProgressData(
-      req.userAuthId,
+      req.studentProfile.id,
       lesson.section.course.id
     );
 
@@ -901,7 +904,7 @@ export const completeLesson = asyncHandler(async (req, res) => {
     }
 
     await checkAndAwardCertificate(
-      req.userAuthId,
+      req.studentProfile.id,
       lesson.section.course.id,
       progressData
     );
@@ -990,7 +993,7 @@ export const accessQuiz = asyncHandler(async (req, res) => {
             course: {
               include: {
                 enrollments: {
-                  where: { studentId: req.userAuthId },
+                  where: { studentId: req.studentProfile.id },
                 },
               },
             },
@@ -1010,7 +1013,7 @@ export const accessQuiz = asyncHandler(async (req, res) => {
           },
         },
         attempts: {
-          where: { studentId: req.userAuthId },
+          where: { studentId: req.studentProfile.id },
           orderBy: { attemptNumber: "desc" },
           include: {
             answers: {
@@ -1154,7 +1157,7 @@ export const startQuizAttempt = asyncHandler(async (req, res) => {
             course: {
               include: {
                 enrollments: {
-                  where: { studentId: req.userAuthId },
+                  where: { studentId: req.studentProfile.id },
                 },
               },
             },
@@ -1164,7 +1167,7 @@ export const startQuizAttempt = asyncHandler(async (req, res) => {
           orderBy: { order: "asc" },
         },
         attempts: {
-          where: { studentId: req.userAuthId },
+          where: { studentId: req.studentProfile.id },
         },
       },
     });
@@ -1217,7 +1220,7 @@ export const startQuizAttempt = asyncHandler(async (req, res) => {
     const attempt = await prisma.quizAttempt.create({
       data: {
         quizId: quizId,
-        studentId: req.userAuthId,
+        studentId: req.studentProfile.id,
         attemptNumber,
         attemptsRemaining: quiz.maxAttempts - attemptNumber,
         totalQuestions: questions.length,
@@ -1304,7 +1307,10 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
                 course: {
                   include: {
                     enrollments: {
-                      where: { studentId: req.userAuthId },
+                      where: {
+                        studentId: req.userAuthId,
+                        status: "ACTIVE",
+                      },
                     },
                   },
                 },
@@ -1341,12 +1347,11 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
     }
 
     const enrollment = attempt.quiz.section.course.enrollments[0];
-    if (!enrollment || enrollment.status !== "ACTIVE") {
+    if (!enrollment) {
       return res.status(403).json({
         success: false,
-        message:
-          "You are not enrolled in this course or enrollment is not active",
-        code: "NOT_ENROLLED_OR_INACTIVE",
+        message: "You are not enrolled in this course",
+        code: "NOT_ENROLLED",
       });
     }
 
@@ -1537,7 +1542,10 @@ export const createNote = asyncHandler(async (req, res) => {
             course: {
               include: {
                 enrollments: {
-                  where: { studentId: req.userAuthId },
+                  where: {
+                    studentId: req.userAuthId,
+                    status: "ACTIVE",
+                  },
                 },
               },
             },
@@ -1637,7 +1645,10 @@ export const createBookmark = asyncHandler(async (req, res) => {
             course: {
               include: {
                 enrollments: {
-                  where: { studentId: req.userAuthId },
+                  where: {
+                    studentId: req.userAuthId,
+                    status: "ACTIVE",
+                  },
                 },
               },
             },

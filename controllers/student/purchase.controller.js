@@ -73,6 +73,254 @@ const validateCoupon = async (couponCode, userId, courseIds, totalAmount) => {
   };
 };
 
+const createPaymentLink = async (gateway, orderData) => {
+  if (gateway === "RAZORPAY") {
+    const razorpayAuth = Buffer.from(
+      `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+    ).toString("base64");
+
+    const paymentLinkData = {
+      amount: Math.round(orderData.amount * 100),
+      currency: orderData.currency,
+      accept_partial: false,
+      description: orderData.description,
+      notify: {
+        sms: false,
+        email: false,
+      },
+      reminder_enable: false,
+      notes: orderData.notes,
+      callback_url: orderData.callback_url,
+      callback_method: orderData.callback_method,
+      expire_by: Math.floor(Date.now() / 1000) + 24 * 60 * 60,
+    };
+
+    if (orderData.customer && orderData.customer.email) {
+      paymentLinkData.customer = {};
+      if (orderData.customer.name)
+        paymentLinkData.customer.name = orderData.customer.name;
+      if (orderData.customer.email)
+        paymentLinkData.customer.email = orderData.customer.email;
+      if (orderData.customer.contact)
+        paymentLinkData.customer.contact = orderData.customer.contact;
+
+      paymentLinkData.notify = {
+        sms: !!orderData.customer.contact,
+        email: !!orderData.customer.email,
+      };
+      paymentLinkData.reminder_enable = true;
+    }
+
+    const response = await fetch("https://api.razorpay.com/v1/payment_links", {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${razorpayAuth}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(paymentLinkData),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(
+        `Razorpay Payment Link creation failed: ${
+          error.error?.description || "Unknown error"
+        }`
+      );
+    }
+
+    return await response.json();
+  }
+
+  if (gateway === "STRIPE") {
+    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: orderData.currency.toLowerCase(),
+            product_data: {
+              name: orderData.description || "Course Purchase",
+            },
+            unit_amount: Math.round(orderData.amount * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "payment",
+      success_url: `${process.env.FRONTEND_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}&order_id=${orderData.receipt}`,
+      cancel_url: `${process.env.FRONTEND_URL}/payment/cancel?order_id=${orderData.receipt}`,
+      metadata: orderData.metadata,
+      client_reference_id: orderData.receipt,
+    });
+
+    return {
+      id: session.id,
+      url: session.url,
+      client_secret: session.client_secret,
+    };
+  }
+
+  if (gateway === "CASHFREE") {
+    const cashfreeAuth = Buffer.from(
+      `${process.env.CASHFREE_APP_ID}:${process.env.CASHFREE_SECRET_KEY}`
+    ).toString("base64");
+
+    const cashfreeData = {
+      order_id: orderData.receipt,
+      order_amount: orderData.amount,
+      order_currency: orderData.currency,
+      customer_details: {
+        customer_id: orderData.notes.userId,
+        customer_email: orderData.customer?.email || "customer@example.com",
+        customer_phone: orderData.customer?.contact || "9999999999",
+      },
+      order_meta: {
+        return_url: `${process.env.FRONTEND_URL}/payment/callback?order_id=${orderData.receipt}`,
+        notify_url: `${process.env.BACKEND_URL}/api/payment/webhook/cashfree`,
+      },
+      order_note: orderData.description,
+    };
+
+    const response = await fetch(`${process.env.CASHFREE_BASE_URL}/pg/orders`, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${cashfreeAuth}`,
+        "Content-Type": "application/json",
+        "x-api-version": "2022-09-01",
+      },
+      body: JSON.stringify(cashfreeData),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(
+        `Cashfree order creation failed: ${error.message || "Unknown error"}`
+      );
+    }
+
+    const result = await response.json();
+    return {
+      id: result.order_id,
+      order_id: result.order_id,
+      payment_session_id: result.payment_session_id,
+      payment_link: result.payment_link,
+    };
+  }
+
+  if (gateway === "PAYU") {
+    const crypto = require("crypto");
+
+    const txnid = `TXN_${Date.now()}_${Math.random()
+      .toString(36)
+      .substr(2, 9)}`;
+    const amount = orderData.amount;
+    const productinfo = orderData.description || "Course Purchase";
+    const firstname = orderData.customer?.name || "Customer";
+    const email = orderData.customer?.email || "customer@example.com";
+    const phone = orderData.customer?.contact || "9999999999";
+    const surl = `${process.env.FRONTEND_URL}/payment/success?order_id=${orderData.receipt}`;
+    const furl = `${process.env.FRONTEND_URL}/payment/failure?order_id=${orderData.receipt}`;
+
+    const hashString = `${process.env.PAYU_KEY}|${txnid}|${amount}|${productinfo}|${firstname}|${email}|||||||||||${process.env.PAYU_SALT}`;
+    const hash = crypto.createHash("sha512").update(hashString).digest("hex");
+
+    const payuData = {
+      key: process.env.PAYU_KEY,
+      txnid,
+      amount,
+      productinfo,
+      firstname,
+      email,
+      phone,
+      surl,
+      furl,
+      hash,
+      service_provider: "payu_paisa",
+    };
+
+    const formData = new URLSearchParams(payuData);
+    const paymentUrl = `${process.env.PAYU_BASE_URL}/_payment`;
+
+    return {
+      id: txnid,
+      txnid,
+      hash,
+      payment_url: paymentUrl,
+      form_data: payuData,
+    };
+  }
+
+  if (gateway === "PAYPAL") {
+    const paypalAuth = Buffer.from(
+      `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`
+    ).toString("base64");
+
+    const tokenResponse = await fetch(
+      `${process.env.PAYPAL_BASE_URL}/v1/oauth2/token`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${paypalAuth}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: "grant_type=client_credentials",
+      }
+    );
+
+    const tokenData = await tokenResponse.json();
+    const accessToken = tokenData.access_token;
+
+    const orderPayload = {
+      intent: "CAPTURE",
+      purchase_units: [
+        {
+          reference_id: orderData.receipt,
+          amount: {
+            currency_code:
+              orderData.currency === "INR" ? "USD" : orderData.currency,
+            value: (orderData.amount / 80).toFixed(2),
+          },
+          description: orderData.description || "Course Purchase",
+        },
+      ],
+      application_context: {
+        return_url: `${process.env.FRONTEND_URL}/payment/success?order_id=${orderData.receipt}`,
+        cancel_url: `${process.env.FRONTEND_URL}/payment/cancel?order_id=${orderData.receipt}`,
+        brand_name: "Your Learning Platform",
+        locale: "en-US",
+        landing_page: "BILLING",
+        user_action: "PAY_NOW",
+      },
+    };
+
+    const orderResponse = await fetch(
+      `${process.env.PAYPAL_BASE_URL}/v2/checkout/orders`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(orderPayload),
+      }
+    );
+
+    if (!orderResponse.ok) {
+      const error = await orderResponse.json();
+      throw new Error(
+        `PayPal order creation failed: ${error.message || "Unknown error"}`
+      );
+    }
+
+    return await orderResponse.json();
+  }
+
+  throw new Error(`Unsupported gateway: ${gateway}`);
+};
+
 export const initiateCheckout = asyncHandler(async (req, res) => {
   const { courseIds, gateway, couponCode, billingAddress } = req.body;
   const userId = req.userAuthId;
@@ -91,19 +339,38 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
     });
   }
 
-  const courses = await prisma.course.findMany({
-    where: {
-      id: { in: courseIds },
-      status: "PUBLISHED",
-    },
-    include: {
-      instructor: {
-        include: {
-          user: { select: { firstName: true, lastName: true } },
+  const [courses, existingEnrollments] = await Promise.all([
+    prisma.course.findMany({
+      where: {
+        id: { in: courseIds },
+        status: "PUBLISHED",
+      },
+      select: {
+        id: true,
+        title: true,
+        price: true,
+        discountPrice: true,
+        instructor: {
+          select: {
+            user: {
+              select: {
+                firstName: true,
+                lastName: true,
+              },
+            },
+          },
         },
       },
-    },
-  });
+    }),
+    prisma.enrollment.findMany({
+      where: {
+        studentId: userId,
+        courseId: { in: courseIds },
+        status: { in: ["ACTIVE", "COMPLETED"] },
+      },
+      select: { courseId: true },
+    }),
+  ]);
 
   if (courses.length !== courseIds.length) {
     return res.status(400).json({
@@ -111,14 +378,6 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
       message: "One or more courses not found or not available",
     });
   }
-
-  const existingEnrollments = await prisma.enrollment.findMany({
-    where: {
-      studentId: userId,
-      courseId: { in: courseIds },
-      status: { in: ["ACTIVE", "COMPLETED"] },
-    },
-  });
 
   if (existingEnrollments.length > 0) {
     return res.status(400).json({
@@ -154,8 +413,10 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
   const orderId = generateOrderId();
 
   try {
-    let gatewayOrderId = null;
+    let gatewayOrder;
+    let checkoutUrl = null;
     let clientSecret = null;
+    let gatewayConfig = {};
 
     const orderData = {
       amount: finalAmount,
@@ -170,16 +431,61 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
         orderId,
         userId,
         courses: courseIds.join(","),
+        orderItems,
       },
+      description: `Course Purchase - ${orderItems
+        .map((item) => item.title)
+        .join(", ")}`,
+      customer: {
+        email: req.userEmail,
+        contact: req.userPhone,
+        name: req.userName,
+      },
+      notify: {
+        sms: true,
+        email: true,
+      },
+      reminder_enable: true,
+      callback_url: `${process.env.FRONTEND_URL}/payment/callback`,
+      callback_method: "get",
     };
 
-    const gatewayOrder = await paymentService.createOrder(gateway, orderData);
+    gatewayOrder = await createPaymentLink(gateway, orderData);
 
     if (gateway === "RAZORPAY") {
-      gatewayOrderId = gatewayOrder.id;
+      checkoutUrl = gatewayOrder.short_url;
+      gatewayConfig = {
+        paymentLinkId: gatewayOrder.id,
+        shortUrl: gatewayOrder.short_url,
+      };
     } else if (gateway === "STRIPE") {
-      gatewayOrderId = gatewayOrder.id;
-      clientSecret = gatewayOrder.client_secret;
+      checkoutUrl = gatewayOrder.url;
+      gatewayConfig = {
+        sessionId: gatewayOrder.id,
+        checkoutUrl: gatewayOrder.url,
+      };
+    } else if (gateway === "CASHFREE") {
+      checkoutUrl = gatewayOrder.payment_link;
+      gatewayConfig = {
+        orderId: gatewayOrder.order_id,
+        paymentSessionId: gatewayOrder.payment_session_id,
+      };
+    } else if (gateway === "PAYU") {
+      checkoutUrl = gatewayOrder.payment_url;
+      gatewayConfig = {
+        key: process.env.PAYU_KEY,
+        txnid: gatewayOrder.txnid,
+        hash: gatewayOrder.hash,
+        formData: gatewayOrder.form_data,
+      };
+    } else if (gateway === "PAYPAL") {
+      checkoutUrl = gatewayOrder.links?.find(
+        (link) => link.rel === "approve"
+      )?.href;
+      gatewayConfig = {
+        orderId: gatewayOrder.id,
+        clientId: process.env.PAYPAL_CLIENT_ID,
+      };
     }
 
     const payment = await prisma.payment.create({
@@ -192,7 +498,7 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
         status: "PENDING",
         method: "CREDIT_CARD",
         gateway,
-        transactionId: gatewayOrderId,
+        transactionId: gatewayOrder.id,
         metadata: {
           orderId,
           courseIds,
@@ -204,25 +510,27 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
     });
 
     if (couponValidation) {
-      await prisma.couponUsage.create({
-        data: {
-          couponId: couponValidation.coupon.id,
-          paymentId: payment.id,
-          userId,
-          discount: discountAmount,
-        },
-      });
-
-      await prisma.coupon.update({
-        where: { id: couponValidation.coupon.id },
-        data: { usedCount: { increment: 1 } },
-      });
+      await Promise.all([
+        prisma.couponUsage.create({
+          data: {
+            couponId: couponValidation.coupon.id,
+            paymentId: payment.id,
+            userId,
+            discount: discountAmount,
+          },
+        }),
+        prisma.coupon.update({
+          where: { id: couponValidation.coupon.id },
+          data: { usedCount: { increment: 1 } },
+        }),
+      ]);
     }
 
     await redisService.setJSON(
       `checkout:${orderId}`,
       {
         paymentId: payment.id,
+        gatewayOrderId: gatewayOrder.id,
         userId,
         courseIds,
         finalAmount,
@@ -236,7 +544,8 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
       data: {
         paymentId: payment.id,
         orderId,
-        gatewayOrderId,
+        gatewayOrderId: gatewayOrder.id,
+        checkoutUrl,
         clientSecret,
         amount: finalAmount,
         currency: "INR",
@@ -245,10 +554,7 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
         discountAmount,
         taxAmount,
         gateway,
-        razorpayKeyId:
-          gateway === "RAZORPAY" ? process.env.RAZORPAY_KEY_ID : undefined,
-        stripePublishableKey:
-          gateway === "STRIPE" ? process.env.STRIPE_PUBLISHABLE_KEY : undefined,
+        gatewayConfig,
       },
     });
   } catch (error) {
@@ -262,13 +568,49 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
 });
 
 export const verifyPayment = asyncHandler(async (req, res) => {
-  const { paymentId, orderId, signature, gateway } = req.body;
+  const { paymentId, gatewayOrderId, signature, orderId, gateway, payerId } =
+    req.body;
   const userId = req.userAuthId;
 
-  if (!paymentId || !orderId) {
+  if (!orderId) {
     return res.status(400).json({
       success: false,
-      message: "Payment ID and Order ID are required",
+      message: "Order ID is required",
+    });
+  }
+
+  if (gateway === "RAZORPAY" && (!paymentId || !gatewayOrderId || !signature)) {
+    return res.status(400).json({
+      success: false,
+      message: "Payment ID, order ID, and signature are required for Razorpay",
+    });
+  }
+
+  if (gateway === "STRIPE" && !paymentId) {
+    return res.status(400).json({
+      success: false,
+      message: "Payment Intent ID is required for Stripe",
+    });
+  }
+
+  if (gateway === "CASHFREE" && (!paymentId || !signature)) {
+    return res.status(400).json({
+      success: false,
+      message: "Payment ID and signature are required for Cashfree",
+    });
+  }
+
+  if (gateway === "PAYU" && (!paymentId || !signature)) {
+    return res.status(400).json({
+      success: false,
+      message: "Transaction ID and hash are required for PayU",
+    });
+  }
+
+  if (gateway === "PAYPAL" && (!paymentId || !payerId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Payment ID and Payer ID are required for PayPal",
     });
   }
 
@@ -282,7 +624,15 @@ export const verifyPayment = asyncHandler(async (req, res) => {
 
   const payment = await prisma.payment.findUnique({
     where: { id: checkoutData.paymentId },
-    include: { couponUsages: true },
+    select: {
+      id: true,
+      amount: true,
+      status: true,
+      transactionId: true,
+      couponUsages: {
+        select: { id: true },
+      },
+    },
   });
 
   if (!payment) {
@@ -292,52 +642,161 @@ export const verifyPayment = asyncHandler(async (req, res) => {
     });
   }
 
+  if (payment.status === "COMPLETED") {
+    return res.status(400).json({
+      success: false,
+      message: "Payment already verified",
+    });
+  }
+
+  const getPaymentMethod = (gateway, paymentDetails) => {
+    if (gateway === "RAZORPAY") {
+      const method = paymentDetails?.method?.toLowerCase();
+      switch (method) {
+        case "card":
+          return paymentDetails?.card?.type === "credit"
+            ? "CREDIT_CARD"
+            : "DEBIT_CARD";
+        case "upi":
+          return "UPI";
+        case "netbanking":
+          return "NET_BANKING";
+        case "wallet":
+          return "WALLET";
+        case "emi":
+          return "EMI";
+        case "bank_transfer":
+          return "BANK_TRANSFER";
+        default:
+          return "UPI";
+      }
+    } else if (gateway === "STRIPE") {
+      const methodType =
+        paymentDetails?.payment_method_types?.[0]?.toLowerCase();
+      switch (methodType) {
+        case "card":
+          return "CREDIT_CARD";
+        case "upi":
+          return "UPI";
+        case "bank_transfer":
+          return "BANK_TRANSFER";
+        default:
+          return "CREDIT_CARD";
+      }
+    } else if (gateway === "CASHFREE") {
+      const method = paymentDetails?.payment_method?.toLowerCase();
+      switch (method) {
+        case "card":
+          return "CREDIT_CARD";
+        case "upi":
+          return "UPI";
+        case "netbanking":
+          return "NET_BANKING";
+        case "wallet":
+          return "WALLET";
+        case "bank_transfer":
+          return "BANK_TRANSFER";
+        default:
+          return "UPI";
+      }
+    } else if (gateway === "PAYU") {
+      const mode = paymentDetails?.mode?.toLowerCase();
+      switch (mode) {
+        case "cc":
+        case "dc":
+        case "creditcard":
+        case "debitcard":
+          return mode === "cc" || mode === "creditcard"
+            ? "CREDIT_CARD"
+            : "DEBIT_CARD";
+        case "upi":
+          return "UPI";
+        case "nb":
+        case "netbanking":
+          return "NET_BANKING";
+        case "wallet":
+          return "WALLET";
+        case "emi":
+          return "EMI";
+        case "banktransfer":
+          return "BANK_TRANSFER";
+        default:
+          return "CREDIT_CARD";
+      }
+    } else if (gateway === "PAYPAL") {
+      return "CREDIT_CARD";
+    }
+    return "CREDIT_CARD";
+  };
+
   try {
     let isVerified = false;
     let paymentDetails = null;
+    let verificationData = {};
 
     if (gateway === "RAZORPAY") {
-      isVerified = paymentService.verifyRazorpayPayment({
-        orderId,
-        paymentId,
-        signature,
-      });
-
-      if (isVerified) {
-        paymentDetails = await paymentService.fetchPaymentDetails(
-          gateway,
-          paymentId
-        );
-        await prisma.payment.update({
-          where: { id: payment.id },
-          data: {
-            status: "COMPLETED",
-            method: paymentDetails.method?.toUpperCase() || "CREDIT_CARD",
-            gatewayResponse: paymentDetails,
-          },
+      if (checkoutData.gatewayOrderId !== gatewayOrderId) {
+        return res.status(400).json({
+          success: false,
+          message: "Order ID mismatch",
         });
       }
+
+      verificationData = {
+        orderId: gatewayOrderId,
+        paymentId: paymentId,
+        signature: signature,
+      };
+
+      isVerified = paymentService.verifyRazorpayPayment(verificationData);
     } else if (gateway === "STRIPE") {
-      isVerified = await paymentService.verifyPayment(gateway, {
+      verificationData = {
         paymentIntentId: paymentId,
-      });
+      };
 
-      if (isVerified) {
-        paymentDetails = await paymentService.fetchPaymentDetails(
-          gateway,
-          paymentId
-        );
-        await prisma.payment.update({
-          where: { id: payment.id },
-          data: {
-            status: "COMPLETED",
-            method:
-              paymentDetails.payment_method_types[0]?.toUpperCase() ||
-              "CREDIT_CARD",
-            gatewayResponse: paymentDetails,
-          },
-        });
-      }
+      isVerified = await paymentService.verifyPayment(
+        gateway,
+        verificationData
+      );
+    } else if (gateway === "CASHFREE") {
+      verificationData = {
+        orderId: checkoutData.gatewayOrderId,
+        paymentId: paymentId,
+        signature: signature,
+      };
+
+      isVerified = await paymentService.verifyPayment(
+        gateway,
+        verificationData
+      );
+    } else if (gateway === "PAYU") {
+      verificationData = {
+        txnid: paymentId,
+        amount: checkoutData.finalAmount,
+        hash: signature,
+      };
+
+      isVerified = await paymentService.verifyPayment(
+        gateway,
+        verificationData
+      );
+    } else if (gateway === "PAYPAL") {
+      verificationData = {
+        paymentId: paymentId,
+        payerId: payerId,
+      };
+
+      isVerified = await paymentService.verifyPayment(
+        gateway,
+        verificationData
+      );
+    }
+
+    if (isVerified) {
+      paymentDetails = await paymentService.fetchPaymentDetails(
+        gateway,
+        paymentId
+      );
     }
 
     if (!isVerified) {
@@ -352,9 +811,26 @@ export const verifyPayment = asyncHandler(async (req, res) => {
       });
     }
 
-    await processPayment(payment.id, checkoutData.courseIds, userId);
+    const paymentMethod = getPaymentMethod(gateway, paymentDetails);
 
-    await redisService.del(`checkout:${orderId}`);
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: "COMPLETED",
+        method: paymentMethod,
+        gatewayResponse: paymentDetails,
+        transactionId: paymentId,
+      },
+    });
+
+    setImmediate(async () => {
+      try {
+        await processPayment(payment.id, checkoutData.courseIds, userId);
+        await redisService.del(`checkout:${orderId}`);
+      } catch (error) {
+        console.error("Background payment processing failed:", error);
+      }
+    });
 
     res.status(200).json({
       success: true,
@@ -364,6 +840,7 @@ export const verifyPayment = asyncHandler(async (req, res) => {
         transactionId: paymentId,
         amount: payment.amount,
         status: "COMPLETED",
+        message: "Enrollment processing initiated",
       },
     });
   } catch (error) {
@@ -388,6 +865,15 @@ const processPayment = async (paymentId, courseIds, userId) => {
     include: { couponUsages: true },
   });
 
+  const student = await prisma.student.findUnique({
+    where: { userId: userId },
+    select: { id: true },
+  });
+
+  if (!student) {
+    throw new Error(`Student profile not found for user: ${userId}`);
+  }
+
   const courses = await prisma.course.findMany({
     where: { id: { in: courseIds } },
     include: { instructor: true },
@@ -399,7 +885,7 @@ const processPayment = async (paymentId, courseIds, userId) => {
   for (const course of courses) {
     const enrollment = await prisma.enrollment.create({
       data: {
-        studentId: userId,
+        studentId: student.id,
         courseId: course.id,
         paymentId: payment.id,
         status: "ACTIVE",
@@ -456,7 +942,7 @@ const processPayment = async (paymentId, courseIds, userId) => {
       data: {
         courseId: course.id,
         courseName: course.title,
-        studentId: userId,
+        studentId: student.id,
         enrollmentId: enrollment.id,
         amount: parseFloat(course.discountPrice || course.price),
       },
@@ -498,7 +984,7 @@ const processPayment = async (paymentId, courseIds, userId) => {
 
   await prisma.cartItem.deleteMany({
     where: {
-      studentId: userId,
+      studentId: student.id,
       courseId: { in: courseIds },
     },
   });
@@ -506,7 +992,6 @@ const processPayment = async (paymentId, courseIds, userId) => {
 
 export const getPurchaseHistory = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10, status, gateway } = req.query;
-  const userId = req.userAuthId;
   const skip = (parseInt(page) - 1) * parseInt(limit);
 
   const where = {};
@@ -518,7 +1003,7 @@ export const getPurchaseHistory = asyncHandler(async (req, res) => {
       where: {
         ...where,
         enrollments: {
-          some: { studentId: userId },
+          some: { studentId: req.studentProfile.id },
         },
       },
       include: {
@@ -553,7 +1038,7 @@ export const getPurchaseHistory = asyncHandler(async (req, res) => {
       where: {
         ...where,
         enrollments: {
-          some: { studentId: userId },
+          some: { studentId: req.studentProfile.id },
         },
       },
     }),

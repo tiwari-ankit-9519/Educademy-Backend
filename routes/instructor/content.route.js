@@ -23,9 +23,6 @@ import {
   createAssignment,
   updateAssignment,
   deleteAssignment,
-  addLessonAttachment,
-  updateLessonAttachment,
-  deleteLessonAttachment,
   getContentStats,
   validateCourseContent,
   publishAllSections,
@@ -39,8 +36,10 @@ import {
   getQuizQuestions,
   getSingleLesson,
   getSingleQuiz,
+  getAllAssignments,
 } from "../../controllers/instructors/content.controller.js";
 import { isLoggedIn, requireInstructor } from "../../middlewares/middleware.js";
+import { uploadAssignmentResources } from "../../config/upload.js";
 
 const router = express.Router();
 
@@ -98,26 +97,16 @@ router.get("/quiz/attempt/:attemptId/results", isLoggedIn, getQuizResults); // F
 router.post(
   "/section/:sectionId/assignments",
   requireInstructor,
+  uploadAssignmentResources.array("resources", 10),
   createAssignment
+);
+router.get(
+  "/section/:sectionId/assignments",
+  requireInstructor,
+  getAllAssignments
 );
 router.put("/assignment/:assignmentId", requireInstructor, updateAssignment);
 router.delete("/assignment/:assignmentId", requireInstructor, deleteAssignment);
-
-router.post(
-  "/lesson/:lessonId/attachments",
-  requireInstructor,
-  addLessonAttachment
-);
-router.put(
-  "/attachment/:attachmentId",
-  requireInstructor,
-  updateLessonAttachment
-);
-router.delete(
-  "/attachment/:attachmentId",
-  requireInstructor,
-  deleteLessonAttachment
-);
 
 router.post(
   "/course/:courseId/publish-sections",

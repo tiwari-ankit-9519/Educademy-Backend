@@ -2067,78 +2067,94 @@ ALTER TABLE "_CouponToCourse" ADD CONSTRAINT "_CouponToCourse_A_fkey" FOREIGN KE
 -- AddForeignKey
 ALTER TABLE "_CouponToCourse" ADD CONSTRAINT "_CouponToCourse_B_fkey" FOREIGN KEY ("B") REFERENCES "Course"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
+-- Function to update course counts (with error handling)
 CREATE OR REPLACE FUNCTION update_course_counts(course_id_param text)
 RETURNS void AS $$
 BEGIN
   UPDATE "Course"
   SET 
-    "sectionsCount" = (
+    "sectionsCount" = COALESCE((
       SELECT COUNT(*) FROM "Section" WHERE "courseId" = course_id_param
-    ),
-    "publishedSectionsCount" = (
+    ), 0),
+    "publishedSectionsCount" = COALESCE((
       SELECT COUNT(*) FROM "Section" WHERE "courseId" = course_id_param AND "isPublished" = true
-    ),
-    "enrollmentsCount" = (
-      SELECT COUNT(*) FROM "Enrollment" WHERE "courseId" = course_id_param
-    ),
-    "reviewsCount" = (
+    ), 0),
+    "enrollmentsCount" = COALESCE((
+      SELECT COUNT(*) FROM "Enrollment" 
+      WHERE "courseId" = course_id_param AND "status" IN ('ACTIVE', 'COMPLETED')
+    ), 0),
+    "reviewsCount" = COALESCE((
       SELECT COUNT(*) FROM "Review" WHERE "courseId" = course_id_param
-    )
+    ), 0),
+    "updatedAt" = NOW()
   WHERE id = course_id_param;
 END;
 $$ LANGUAGE plpgsql;
 
--- Initialize counts for existing courses
+-- Initialize counts for ALL courses (including those without sections/enrollments/reviews)
 UPDATE "Course" 
 SET 
   "sectionsCount" = COALESCE(sections_data.sections_count, 0),
   "publishedSectionsCount" = COALESCE(sections_data.published_count, 0),
   "enrollmentsCount" = COALESCE(enrollments_data.enrollments_count, 0),
-  "reviewsCount" = COALESCE(reviews_data.reviews_count, 0)
+  "reviewsCount" = COALESCE(reviews_data.reviews_count, 0),
+  "updatedAt" = NOW()
 FROM (
+  -- Get all courses first, then LEFT JOIN with counts
+  SELECT DISTINCT id as course_id FROM "Course"
+) all_courses
+LEFT JOIN (
   SELECT 
     "courseId",
     COUNT(*) as sections_count,
     COUNT(CASE WHEN "isPublished" = true THEN 1 END) as published_count
   FROM "Section"
   GROUP BY "courseId"
-) sections_data
+) sections_data ON all_courses.course_id = sections_data."courseId"
 LEFT JOIN (
   SELECT "courseId", COUNT(*) as enrollments_count
   FROM "Enrollment"
+  WHERE "status" IN ('ACTIVE', 'COMPLETED')
   GROUP BY "courseId"
-) enrollments_data ON sections_data."courseId" = enrollments_data."courseId"
+) enrollments_data ON all_courses.course_id = enrollments_data."courseId"
 LEFT JOIN (
   SELECT "courseId", COUNT(*) as reviews_count
   FROM "Review"
   GROUP BY "courseId"
-) reviews_data ON sections_data."courseId" = reviews_data."courseId"
-WHERE "Course".id = sections_data."courseId";
+) reviews_data ON all_courses.course_id = reviews_data."courseId"
+WHERE "Course".id = all_courses.course_id;
 
--- Trigger functions
+-- Improved trigger function for sections with bounds checking
 CREATE OR REPLACE FUNCTION update_course_sections_count()
 RETURNS TRIGGER AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
     UPDATE "Course"
     SET 
-      "sectionsCount" = "sectionsCount" + 1,
-      "publishedSectionsCount" = "publishedSectionsCount" + CASE WHEN NEW."isPublished" = true THEN 1 ELSE 0 END
+      "sectionsCount" = GREATEST("sectionsCount" + 1, 0),
+      "publishedSectionsCount" = GREATEST("publishedSectionsCount" + CASE WHEN NEW."isPublished" = true THEN 1 ELSE 0 END, 0),
+      "updatedAt" = NOW()
     WHERE id = NEW."courseId";
     RETURN NEW;
+    
   ELSIF TG_OP = 'UPDATE' THEN
+    -- Only update if publication status changed
     IF OLD."isPublished" != NEW."isPublished" THEN
       UPDATE "Course"
-      SET "publishedSectionsCount" = "publishedSectionsCount" + 
-        CASE WHEN NEW."isPublished" = true THEN 1 ELSE -1 END
+      SET 
+        "publishedSectionsCount" = GREATEST("publishedSectionsCount" + 
+          CASE WHEN NEW."isPublished" = true THEN 1 ELSE -1 END, 0),
+        "updatedAt" = NOW()
       WHERE id = NEW."courseId";
     END IF;
     RETURN NEW;
+    
   ELSIF TG_OP = 'DELETE' THEN
     UPDATE "Course"
     SET 
-      "sectionsCount" = "sectionsCount" - 1,
-      "publishedSectionsCount" = "publishedSectionsCount" - CASE WHEN OLD."isPublished" = true THEN 1 ELSE 0 END
+      "sectionsCount" = GREATEST("sectionsCount" - 1, 0),
+      "publishedSectionsCount" = GREATEST("publishedSectionsCount" - CASE WHEN OLD."isPublished" = true THEN 1 ELSE 0 END, 0),
+      "updatedAt" = NOW()
     WHERE id = OLD."courseId";
     RETURN OLD;
   END IF;
@@ -2146,46 +2162,205 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Improved trigger function for enrollments with status filtering
 CREATE OR REPLACE FUNCTION update_course_enrollments_count()
 RETURNS TRIGGER AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    UPDATE "Course" SET "enrollmentsCount" = "enrollmentsCount" + 1 WHERE id = NEW."courseId";
+    -- Only count ACTIVE and COMPLETED enrollments
+    IF NEW."status" IN ('ACTIVE', 'COMPLETED') THEN
+      UPDATE "Course" 
+      SET 
+        "enrollmentsCount" = GREATEST("enrollmentsCount" + 1, 0),
+        "updatedAt" = NOW()
+      WHERE id = NEW."courseId";
+    END IF;
     RETURN NEW;
+    
+  ELSIF TG_OP = 'UPDATE' THEN
+    -- Handle status changes
+    IF OLD."status" != NEW."status" THEN
+      IF OLD."status" IN ('ACTIVE', 'COMPLETED') AND NEW."status" NOT IN ('ACTIVE', 'COMPLETED') THEN
+        -- Enrollment became inactive
+        UPDATE "Course" 
+        SET 
+          "enrollmentsCount" = GREATEST("enrollmentsCount" - 1, 0),
+          "updatedAt" = NOW()
+        WHERE id = NEW."courseId";
+      ELSIF OLD."status" NOT IN ('ACTIVE', 'COMPLETED') AND NEW."status" IN ('ACTIVE', 'COMPLETED') THEN
+        -- Enrollment became active
+        UPDATE "Course" 
+        SET 
+          "enrollmentsCount" = GREATEST("enrollmentsCount" + 1, 0),
+          "updatedAt" = NOW()
+        WHERE id = NEW."courseId";
+      END IF;
+    END IF;
+    RETURN NEW;
+    
   ELSIF TG_OP = 'DELETE' THEN
-    UPDATE "Course" SET "enrollmentsCount" = "enrollmentsCount" - 1 WHERE id = OLD."courseId";
+    -- Only decrease count if the deleted enrollment was active
+    IF OLD."status" IN ('ACTIVE', 'COMPLETED') THEN
+      UPDATE "Course" 
+      SET 
+        "enrollmentsCount" = GREATEST("enrollmentsCount" - 1, 0),
+        "updatedAt" = NOW()
+      WHERE id = OLD."courseId";
+    END IF;
     RETURN OLD;
   END IF;
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
+-- Improved trigger function for reviews
 CREATE OR REPLACE FUNCTION update_course_reviews_count()
 RETURNS TRIGGER AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    UPDATE "Course" SET "reviewsCount" = "reviewsCount" + 1 WHERE id = NEW."courseId";
+    UPDATE "Course" 
+    SET 
+      "reviewsCount" = GREATEST("reviewsCount" + 1, 0),
+      "updatedAt" = NOW()
+    WHERE id = NEW."courseId";
     RETURN NEW;
+    
   ELSIF TG_OP = 'DELETE' THEN
-    UPDATE "Course" SET "reviewsCount" = "reviewsCount" - 1 WHERE id = OLD."courseId";
+    UPDATE "Course" 
+    SET 
+      "reviewsCount" = GREATEST("reviewsCount" - 1, 0),
+      "updatedAt" = NOW()
+    WHERE id = OLD."courseId";
     RETURN OLD;
   END IF;
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
--- Create triggers
+-- Function to update instructor stats
+CREATE OR REPLACE FUNCTION update_instructor_stats(instructor_id_param text)
+RETURNS void AS $$
+BEGIN
+  UPDATE "Instructor"
+  SET 
+    "totalCourses" = COALESCE((
+      SELECT COUNT(*) FROM "Course" 
+      WHERE "instructorId" = instructor_id_param AND "status" = 'PUBLISHED'
+    ), 0),
+    "totalStudents" = COALESCE((
+      SELECT COUNT(DISTINCT "studentId") FROM "Enrollment" e
+      JOIN "Course" c ON e."courseId" = c.id
+      WHERE c."instructorId" = instructor_id_param 
+      AND e."status" IN ('ACTIVE', 'COMPLETED')
+    ), 0),
+    "updatedAt" = NOW()
+  WHERE id = instructor_id_param;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger function for instructor stats when courses change
+CREATE OR REPLACE FUNCTION update_instructor_stats_on_course()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+    PERFORM update_instructor_stats(NEW."instructorId");
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    PERFORM update_instructor_stats(OLD."instructorId");
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger function for instructor stats when enrollments change
+CREATE OR REPLACE FUNCTION update_instructor_stats_on_enrollment()
+RETURNS TRIGGER AS $$
+DECLARE
+  instructor_id_val text;
+BEGIN
+  IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+    SELECT "instructorId" INTO instructor_id_val 
+    FROM "Course" WHERE id = NEW."courseId";
+    PERFORM update_instructor_stats(instructor_id_val);
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    SELECT "instructorId" INTO instructor_id_val 
+    FROM "Course" WHERE id = OLD."courseId";
+    PERFORM update_instructor_stats(instructor_id_val);
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Drop existing triggers
 DROP TRIGGER IF EXISTS trigger_update_course_sections_count ON "Section";
+DROP TRIGGER IF EXISTS trigger_update_course_enrollments_count ON "Enrollment";
+DROP TRIGGER IF EXISTS trigger_update_course_reviews_count ON "Review";
+DROP TRIGGER IF EXISTS trigger_update_instructor_stats_on_course ON "Course";
+DROP TRIGGER IF EXISTS trigger_update_instructor_stats_on_enrollment ON "Enrollment";
+
+-- Create triggers for course counts
 CREATE TRIGGER trigger_update_course_sections_count
   AFTER INSERT OR UPDATE OR DELETE ON "Section"
   FOR EACH ROW EXECUTE FUNCTION update_course_sections_count();
 
-DROP TRIGGER IF EXISTS trigger_update_course_enrollments_count ON "Enrollment";
 CREATE TRIGGER trigger_update_course_enrollments_count
-  AFTER INSERT OR DELETE ON "Enrollment"
+  AFTER INSERT OR UPDATE OR DELETE ON "Enrollment"
   FOR EACH ROW EXECUTE FUNCTION update_course_enrollments_count();
 
-DROP TRIGGER IF EXISTS trigger_update_course_reviews_count ON "Review";
 CREATE TRIGGER trigger_update_course_reviews_count
   AFTER INSERT OR DELETE ON "Review"
   FOR EACH ROW EXECUTE FUNCTION update_course_reviews_count();
+
+-- Create triggers for instructor stats
+CREATE TRIGGER trigger_update_instructor_stats_on_course
+  AFTER INSERT OR UPDATE OF "status" OR DELETE ON "Course"
+  FOR EACH ROW EXECUTE FUNCTION update_instructor_stats_on_course();
+
+CREATE TRIGGER trigger_update_instructor_stats_on_enrollment
+  AFTER INSERT OR UPDATE OF "status" OR DELETE ON "Enrollment"
+  FOR EACH ROW EXECUTE FUNCTION update_instructor_stats_on_enrollment();
+
+-- Initialize instructor stats for existing instructors
+UPDATE "Instructor" 
+SET 
+  "totalCourses" = COALESCE(courses_data.courses_count, 0),
+  "totalStudents" = COALESCE(students_data.students_count, 0),
+  "updatedAt" = NOW()
+FROM (
+  SELECT 
+    "instructorId",
+    COUNT(*) as courses_count
+  FROM "Course"
+  WHERE "status" = 'PUBLISHED'
+  GROUP BY "instructorId"
+) courses_data
+LEFT JOIN (
+  SELECT 
+    c."instructorId",
+    COUNT(DISTINCT e."studentId") as students_count
+  FROM "Enrollment" e
+  JOIN "Course" c ON e."courseId" = c.id
+  WHERE e."status" IN ('ACTIVE', 'COMPLETED')
+  GROUP BY c."instructorId"
+) students_data ON courses_data."instructorId" = students_data."instructorId"
+WHERE "Instructor".id = courses_data."instructorId";
+
+-- Handle instructors with no courses
+UPDATE "Instructor" 
+SET 
+  "totalCourses" = 0,
+  "totalStudents" = 0,
+  "updatedAt" = NOW()
+WHERE id NOT IN (
+  SELECT DISTINCT "instructorId" FROM "Course" WHERE "status" = 'PUBLISHED'
+);
+
+-- Create indexes for better performance
+CREATE INDEX IF NOT EXISTS idx_section_course_published ON "Section" ("courseId", "isPublished");
+CREATE INDEX IF NOT EXISTS idx_enrollment_course_status ON "Enrollment" ("courseId", "status");
+CREATE INDEX IF NOT EXISTS idx_enrollment_student_status ON "Enrollment" ("studentId", "status");
+CREATE INDEX IF NOT EXISTS idx_review_course ON "Review" ("courseId");
+CREATE INDEX IF NOT EXISTS idx_course_instructor_status ON "Course" ("instructorId", "status");

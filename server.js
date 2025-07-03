@@ -21,7 +21,6 @@ import notificationRoutes from "./routes/common/notification.route.js";
 import uploadRoutes from "./routes/common/upload.route.js";
 import searchRoutes from "./routes/common/search.route.js";
 import supportRoutes from "./routes/common/ticket.route.js";
-import courseRoutes from "./routes/common/course.route.js";
 import adminAnalyticsRoutes from "./routes/admin/adminAnalytics.route.js";
 import adminCourseRoutes from "./routes/admin/adminCourse.route.js";
 import adminModerationRoutes from "./routes/admin/adminModeration.route.js";
@@ -363,7 +362,6 @@ app.use("/api/notifications", authRateLimit, notificationRoutes);
 app.use("/api/upload", authRateLimit, uploadRoutes);
 app.use("/api/search", authRateLimit, searchRoutes);
 app.use("/api/support", authRateLimit, supportRoutes);
-app.use("/api/courses", authRateLimit, courseRoutes);
 
 app.use("/api/admin/analytics", authRateLimit, adminAnalyticsRoutes);
 app.use("/api/admin/courses", authRateLimit, adminCourseRoutes);

@@ -302,7 +302,6 @@ const isStudent = async (req, res, next) => {
         code: "EMAIL_NOT_VERIFIED",
       });
     }
-
     req.studentProfile = studentProfile;
     next();
   } catch (error) {

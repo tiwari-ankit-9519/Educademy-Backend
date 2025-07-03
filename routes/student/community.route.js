@@ -8,14 +8,15 @@ import {
   getCourseQnA,
   askQuestion,
   incrementQuestionViews,
+  rateCourse,
 } from "../../controllers/student/community.controller.js";
-import { isLoggedIn } from "../../middlewares/middleware.js";
+import { isLoggedIn, requireStudent } from "../../middlewares/middleware.js";
 
 const router = express.Router();
 
-router.get("/courses/:courseId/reviews", getCourseReviews);
+router.get("/courses/:courseId/reviews", getCourseReviews); // Common
 
-router.post("/courses/:courseId/reviews", isLoggedIn, createReview);
+router.post("/courses/:courseId/reviews", requireStudent, createReview);
 
 router.put("/reviews/:reviewId", isLoggedIn, updateReview);
 
@@ -25,8 +26,10 @@ router.post("/reviews/:reviewId/replies", isLoggedIn, addReviewReply);
 
 router.get("/courses/:courseId/qna", getCourseQnA);
 
-router.post("/courses/:courseId/qna", isLoggedIn, askQuestion);
+router.post("/courses/:courseId/qna", requireStudent, askQuestion);
 
-router.post("/questions/:questionId/views", isLoggedIn, incrementQuestionViews);
+router.post("/questions/:questionId/views", incrementQuestionViews);
+
+router.post("/courses/:courseId/rating", requireStudent, rateCourse);
 
 export default router;

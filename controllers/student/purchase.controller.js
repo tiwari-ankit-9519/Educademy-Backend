@@ -4,6 +4,7 @@ import redisService from "../../utils/redis.js";
 import emailService from "../../utils/emailService.js";
 import notificationService from "../../utils/notificationservice.js";
 import paymentService from "../../utils/paymentService.js";
+import Stripe from "stripe";
 
 const prisma = new PrismaClient();
 
@@ -133,7 +134,7 @@ const createPaymentLink = async (gateway, orderData) => {
   }
 
   if (gateway === "STRIPE") {
-    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -418,6 +419,33 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
     let clientSecret = null;
     let gatewayConfig = {};
 
+    // Prepare metadata based on gateway
+    let metadata;
+    if (gateway === "STRIPE") {
+      // For Stripe, convert objects to strings
+      metadata = {
+        orderId: String(orderId),
+        userId: String(userId),
+        courses: courseIds.join(","),
+        orderItems: JSON.stringify(orderItems), // Convert to string
+        billingAddress: String(billingAddress || ""),
+        couponCode: String(couponValidation?.coupon?.code || ""),
+        courseCount: String(courseIds.length),
+        subtotal: String(subtotal),
+        discountAmount: String(discountAmount),
+        taxAmount: String(taxAmount),
+        finalAmount: String(finalAmount),
+      };
+    } else {
+      // For other gateways (like Razorpay), objects are fine
+      metadata = {
+        orderId,
+        userId,
+        courses: courseIds.join(","),
+        orderItems,
+      };
+    }
+
     const orderData = {
       amount: finalAmount,
       currency: "INR",
@@ -427,12 +455,7 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
         userId,
         courses: courseIds.join(","),
       },
-      metadata: {
-        orderId,
-        userId,
-        courses: courseIds.join(","),
-        orderItems,
-      },
+      metadata,
       description: `Course Purchase - ${orderItems
         .map((item) => item.title)
         .join(", ")}`,
@@ -568,9 +591,40 @@ export const initiateCheckout = asyncHandler(async (req, res) => {
 });
 
 export const verifyPayment = asyncHandler(async (req, res) => {
-  const { paymentId, gatewayOrderId, signature, orderId, gateway, payerId } =
-    req.body;
+  const {
+    paymentId: reqPaymentId,
+    paymentIntentId,
+    sessionId,
+    gatewayOrderId,
+    signature,
+    orderId,
+    gateway,
+    payerId,
+  } = req.body;
+
   const userId = req.userAuthId;
+
+  let paymentId = reqPaymentId || paymentIntentId;
+
+  if (gateway === "STRIPE" && sessionId && !paymentId) {
+    try {
+      const stripe = paymentService.getStripe();
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      paymentId = session.payment_intent;
+
+      if (!paymentId) {
+        return res.status(400).json({
+          success: false,
+          message: "No payment intent found in Stripe session",
+        });
+      }
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Stripe session ID",
+      });
+    }
+  }
 
   if (!orderId) {
     return res.status(400).json({
@@ -586,10 +640,10 @@ export const verifyPayment = asyncHandler(async (req, res) => {
     });
   }
 
-  if (gateway === "STRIPE" && !paymentId) {
+  if (gateway === "STRIPE" && !paymentId && !sessionId) {
     return res.status(400).json({
       success: false,
-      message: "Payment Intent ID is required for Stripe",
+      message: "Payment Intent ID or Session ID is required for Stripe",
     });
   }
 
@@ -825,7 +879,11 @@ export const verifyPayment = asyncHandler(async (req, res) => {
 
     setImmediate(async () => {
       try {
-        await processPayment(payment.id, checkoutData.courseIds, userId);
+        const enrollments = await processPayment(
+          payment.id,
+          checkoutData.courseIds,
+          userId
+        );
         await redisService.del(`checkout:${orderId}`);
       } catch (error) {
         console.error("Background payment processing failed:", error);
@@ -841,6 +899,7 @@ export const verifyPayment = asyncHandler(async (req, res) => {
         amount: payment.amount,
         status: "COMPLETED",
         message: "Enrollment processing initiated",
+        enrollments,
       },
     });
   } catch (error) {
@@ -891,6 +950,13 @@ const processPayment = async (paymentId, courseIds, userId) => {
         status: "ACTIVE",
         enrollmentSource: "PURCHASE",
         discountApplied: payment.discountAmount,
+      },
+      select: {
+        id: true,
+        courseId: true,
+        studentId: true,
+        status: true,
+        createdAt: true,
       },
     });
 
@@ -988,6 +1054,8 @@ const processPayment = async (paymentId, courseIds, userId) => {
       courseId: { in: courseIds },
     },
   });
+
+  return enrollments;
 };
 
 export const getPurchaseHistory = asyncHandler(async (req, res) => {

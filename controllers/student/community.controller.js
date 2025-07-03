@@ -44,7 +44,7 @@ export const getCourseReviews = asyncHandler(async (req, res) => {
 
     const cacheKey = generateCacheKey("course_reviews", {
       courseId,
-      userId: req.userAuthId,
+      userId: req.userAuthId || "anonymous",
       page,
       limit,
       sortBy,
@@ -165,24 +165,27 @@ export const getCourseReviews = asyncHandler(async (req, res) => {
       }),
     ]);
 
-    const currentUserReview = await prisma.review.findUnique({
-      where: {
-        authorId_courseId: {
-          authorId: req.userAuthId,
-          courseId: courseId,
-        },
-      },
-      include: {
-        author: {
-          select: {
-            id: true,
-            firstName: true,
-            lastName: true,
-            profileImage: true,
+    let currentUserReview = null;
+    if (req.userAuthId) {
+      currentUserReview = await prisma.review.findUnique({
+        where: {
+          authorId_courseId: {
+            authorId: req.userAuthId,
+            courseId: courseId,
           },
         },
-      },
-    });
+        include: {
+          author: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              profileImage: true,
+            },
+          },
+        },
+      });
+    }
 
     const ratingDistribution = [5, 4, 3, 2, 1].map((rating) => {
       const stat = ratingStats.find((s) => s.rating === rating);
@@ -311,12 +314,12 @@ export const createReview = asyncHandler(async (req, res) => {
 
   try {
     const { courseId } = req.params;
-    const { title, content, rating, pros = [], cons = [] } = req.body;
+    const { title = null, content, rating, pros = [], cons = [] } = req.body;
 
-    if (!title || !content || !rating) {
+    if (!content || !rating) {
       return res.status(400).json({
         success: false,
-        message: "Title, content, and rating are required",
+        message: "Content and rating are required",
         code: "MISSING_REQUIRED_FIELDS",
       });
     }
@@ -373,10 +376,23 @@ export const createReview = asyncHandler(async (req, res) => {
       });
     }
 
+    const studentProfile = await prisma.student.findUnique({
+      where: { userId: req.userAuthId },
+      select: { id: true },
+    });
+
+    if (!studentProfile) {
+      return res.status(404).json({
+        success: false,
+        message: "Student profile not found",
+        code: "STUDENT_NOT_FOUND",
+      });
+    }
+
     const enrollment = await prisma.enrollment.findUnique({
       where: {
         studentId_courseId: {
-          studentId: req.userAuthId,
+          studentId: studentProfile.id,
           courseId: courseId,
         },
       },
@@ -400,10 +416,68 @@ export const createReview = asyncHandler(async (req, res) => {
     });
 
     if (existingReview) {
-      return res.status(400).json({
-        success: false,
-        message: "You have already reviewed this course",
-        code: "REVIEW_ALREADY_EXISTS",
+      const updatedReview = await prisma.review.update({
+        where: {
+          authorId_courseId: {
+            authorId: req.userAuthId,
+            courseId: courseId,
+          },
+        },
+        data: {
+          title: title ? title.trim() : null,
+          content: content.trim(),
+          rating: parseInt(rating),
+          pros: Array.isArray(pros)
+            ? pros.filter((p) => p.trim().length > 0)
+            : [],
+          cons: Array.isArray(cons)
+            ? cons.filter((c) => c.trim().length > 0)
+            : [],
+          isVerified: enrollment.status === "COMPLETED",
+        },
+        include: {
+          author: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              profileImage: true,
+            },
+          },
+        },
+      });
+
+      await updateCourseRating(courseId);
+      await invalidateCommunityCache(courseId);
+
+      const executionTime = performance.now() - startTime;
+
+      return res.status(200).json({
+        success: true,
+        message: "Review updated successfully",
+        data: {
+          review: {
+            id: updatedReview.id,
+            title: updatedReview.title,
+            content: updatedReview.content,
+            rating: updatedReview.rating,
+            pros: updatedReview.pros,
+            cons: updatedReview.cons,
+            isVerified: updatedReview.isVerified,
+            createdAt: updatedReview.createdAt,
+            updatedAt: updatedReview.updatedAt,
+            author: {
+              id: updatedReview.author.id,
+              name: `${updatedReview.author.firstName} ${updatedReview.author.lastName}`,
+              profileImage: updatedReview.author.profileImage,
+            },
+          },
+        },
+        meta: {
+          requestId,
+          executionTime: Math.round(executionTime),
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -411,7 +485,7 @@ export const createReview = asyncHandler(async (req, res) => {
       data: {
         authorId: req.userAuthId,
         courseId: courseId,
-        title: title.trim(),
+        title: title ? title.trim() : null,
         content: content.trim(),
         rating: parseInt(rating),
         pros: Array.isArray(pros)
@@ -429,11 +503,6 @@ export const createReview = asyncHandler(async (req, res) => {
             firstName: true,
             lastName: true,
             profileImage: true,
-          },
-        },
-        course: {
-          select: {
-            title: true,
           },
         },
       },
@@ -897,7 +966,7 @@ export const getCourseQnA = asyncHandler(async (req, res) => {
 
     const cacheKey = generateCacheKey("course_qna", {
       courseId,
-      userId: req.userAuthId,
+      userId: req.userAuthId || "anonymous",
       page,
       limit,
       sortBy,
@@ -1027,14 +1096,25 @@ export const getCourseQnA = asyncHandler(async (req, res) => {
       prisma.qnAQuestion.count({ where }),
     ]);
 
-    const isEnrolled = await prisma.enrollment.findUnique({
-      where: {
-        studentId_courseId: {
-          studentId: req.userAuthId,
-          courseId: courseId,
-        },
-      },
-    });
+    let canAskQuestion = false;
+    if (req.userAuthId) {
+      const studentProfile = await prisma.student.findUnique({
+        where: { userId: req.userAuthId },
+        select: { id: true },
+      });
+
+      if (studentProfile) {
+        const isEnrolled = await prisma.enrollment.findUnique({
+          where: {
+            studentId_courseId: {
+              studentId: studentProfile.id,
+              courseId: courseId,
+            },
+          },
+        });
+        canAskQuestion = !!isEnrolled;
+      }
+    }
 
     const result = {
       course: {
@@ -1100,7 +1180,7 @@ export const getCourseQnA = asyncHandler(async (req, res) => {
         unresolvedCount: questions.filter((q) => !q.isResolved).length,
       },
       permissions: {
-        canAskQuestion: !!isEnrolled,
+        canAskQuestion,
         canAnswerQuestion: req.userAuthId === course.instructor.userId,
       },
     };
@@ -1150,21 +1230,13 @@ export const askQuestion = asyncHandler(async (req, res) => {
 
   try {
     const { courseId } = req.params;
-    const { title, content, lessonId } = req.body;
+    const { title = null, content, lessonId } = req.body;
 
-    if (!title || !content) {
+    if (!content) {
       return res.status(400).json({
         success: false,
-        message: "Title and content are required",
+        message: "Content is required",
         code: "MISSING_REQUIRED_FIELDS",
-      });
-    }
-
-    if (title.length < 5 || title.length > 200) {
-      return res.status(400).json({
-        success: false,
-        message: "Title must be between 5 and 200 characters",
-        code: "INVALID_TITLE_LENGTH",
       });
     }
 
@@ -1179,7 +1251,7 @@ export const askQuestion = asyncHandler(async (req, res) => {
     const enrollment = await prisma.enrollment.findUnique({
       where: {
         studentId_courseId: {
-          studentId: req.userAuthId,
+          studentId: req.studentProfile.id,
           courseId: courseId,
         },
       },
@@ -1231,14 +1303,28 @@ export const askQuestion = asyncHandler(async (req, res) => {
       }
     }
 
-    const question = await prisma.qnAQuestion.create({
-      data: {
-        studentId: req.studentProfile.id,
-        courseId: courseId,
-        lessonId: lessonId || null,
-        title: title.trim(),
-        content: content.trim(),
+    const questionData = {
+      student: {
+        connect: { id: req.studentProfile.id },
       },
+      course: {
+        connect: { id: courseId },
+      },
+      content: content.trim(),
+    };
+
+    if (title && title.trim()) {
+      questionData.title = title.trim();
+    }
+
+    if (lessonId) {
+      questionData.lesson = {
+        connect: { id: lessonId },
+      };
+    }
+
+    const question = await prisma.qnAQuestion.create({
+      data: questionData,
       include: {
         student: {
           include: {
@@ -1310,7 +1396,7 @@ export const askQuestion = asyncHandler(async (req, res) => {
       data: {
         question: {
           id: question.id,
-          title: question.title,
+          title: question.title || "",
           content: question.content,
           isResolved: question.isResolved,
           views: question.views,
@@ -1382,7 +1468,11 @@ export const incrementQuestionViews = asyncHandler(async (req, res) => {
       });
     }
 
-    if (question.student.userId !== req.userAuthId) {
+    const isAuthor =
+      req.userAuthId && question.student.userId === req.userAuthId;
+    const shouldIncrementViews = !isAuthor;
+
+    if (shouldIncrementViews) {
       await prisma.qnAQuestion.update({
         where: { id: questionId },
         data: {
@@ -1401,8 +1491,7 @@ export const incrementQuestionViews = asyncHandler(async (req, res) => {
       success: true,
       message: "Question views incremented",
       data: {
-        views:
-          question.views + (question.student.userId !== req.userAuthId ? 1 : 0),
+        views: question.views + (shouldIncrementViews ? 1 : 0),
       },
       meta: {
         requestId,
@@ -1484,3 +1573,242 @@ const updateCourseRating = async (courseId) => {
     console.error("Error updating course rating:", error);
   }
 };
+
+export const rateCourse = asyncHandler(async (req, res) => {
+  const requestId = generateRequestId();
+  const startTime = performance.now();
+
+  try {
+    const { courseId } = req.params;
+    const { rating } = req.body;
+
+    if (!rating) {
+      return res.status(400).json({
+        success: false,
+        message: "Rating is required",
+        code: "MISSING_REQUIRED_FIELDS",
+      });
+    }
+
+    if (rating < 1 || rating > 5) {
+      return res.status(400).json({
+        success: false,
+        message: "Rating must be between 1 and 5",
+        code: "INVALID_RATING",
+      });
+    }
+
+    const course = await prisma.course.findUnique({
+      where: { id: courseId },
+      select: {
+        id: true,
+        title: true,
+        status: true,
+        instructor: {
+          select: {
+            userId: true,
+            user: {
+              select: {
+                firstName: true,
+                lastName: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        message: "Course not found",
+        code: "COURSE_NOT_FOUND",
+      });
+    }
+
+    if (course.status !== "PUBLISHED") {
+      return res.status(400).json({
+        success: false,
+        message: "Course is not available for rating",
+        code: "COURSE_NOT_AVAILABLE",
+      });
+    }
+
+    const studentProfile = await prisma.student.findUnique({
+      where: { userId: req.userAuthId },
+      select: { id: true },
+    });
+
+    if (!studentProfile) {
+      return res.status(404).json({
+        success: false,
+        message: "Student profile not found",
+        code: "STUDENT_NOT_FOUND",
+      });
+    }
+
+    const enrollment = await prisma.enrollment.findUnique({
+      where: {
+        studentId_courseId: {
+          studentId: studentProfile.id,
+          courseId: courseId,
+        },
+      },
+    });
+
+    if (!enrollment) {
+      return res.status(403).json({
+        success: false,
+        message: "You must be enrolled in this course to rate it",
+        code: "NOT_ENROLLED",
+      });
+    }
+
+    const existingReview = await prisma.review.findUnique({
+      where: {
+        authorId_courseId: {
+          authorId: req.userAuthId,
+          courseId: courseId,
+        },
+      },
+    });
+
+    if (existingReview) {
+      const updatedReview = await prisma.review.update({
+        where: {
+          authorId_courseId: {
+            authorId: req.userAuthId,
+            courseId: courseId,
+          },
+        },
+        data: {
+          rating: parseInt(rating),
+        },
+        include: {
+          author: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              profileImage: true,
+            },
+          },
+        },
+      });
+
+      await updateCourseRating(courseId);
+      await invalidateCommunityCache(courseId);
+
+      const executionTime = performance.now() - startTime;
+
+      return res.status(200).json({
+        success: true,
+        message: "Rating updated successfully",
+        data: {
+          rating: {
+            id: updatedReview.id,
+            rating: updatedReview.rating,
+            createdAt: updatedReview.createdAt,
+            updatedAt: updatedReview.updatedAt,
+            author: {
+              id: updatedReview.author.id,
+              name: `${updatedReview.author.firstName} ${updatedReview.author.lastName}`,
+              profileImage: updatedReview.author.profileImage,
+            },
+          },
+        },
+        meta: {
+          requestId,
+          executionTime: Math.round(executionTime),
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+
+    const review = await prisma.review.create({
+      data: {
+        authorId: req.userAuthId,
+        courseId: courseId,
+        title: null,
+        content: `Rated ${rating} stars`,
+        rating: parseInt(rating),
+        pros: [],
+        cons: [],
+        isVerified: enrollment.status === "COMPLETED",
+      },
+      include: {
+        author: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            profileImage: true,
+          },
+        },
+      },
+    });
+
+    await updateCourseRating(courseId);
+    await invalidateCommunityCache(courseId);
+
+    await notificationService.createNotification({
+      userId: course.instructor.userId,
+      type: "NEW_REVIEW",
+      title: "New Course Rating",
+      message: `${review.author.firstName} ${review.author.lastName} rated "${course.title}" with ${rating} stars`,
+      data: {
+        courseId,
+        courseName: course.title,
+        reviewId: review.id,
+        reviewerName: `${review.author.firstName} ${review.author.lastName}`,
+        rating,
+      },
+      actionUrl: `${process.env.FRONTEND_URL}/instructor/courses/${courseId}/reviews`,
+      sendEmail: false,
+    });
+
+    const executionTime = performance.now() - startTime;
+
+    res.status(201).json({
+      success: true,
+      message: "Course rated successfully",
+      data: {
+        rating: {
+          id: review.id,
+          rating: review.rating,
+          createdAt: review.createdAt,
+          author: {
+            id: review.author.id,
+            name: `${review.author.firstName} ${review.author.lastName}`,
+            profileImage: review.author.profileImage,
+          },
+        },
+      },
+      meta: {
+        requestId,
+        executionTime: Math.round(executionTime),
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error(`RATE_COURSE_ERROR [${requestId}]:`, {
+      error: error.message,
+      stack: error.stack,
+      courseId: req.params.courseId,
+      userId: req.userAuthId,
+    });
+
+    const executionTime = performance.now() - startTime;
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to rate course",
+      code: "INTERNAL_SERVER_ERROR",
+      meta: {
+        requestId,
+        executionTime: Math.round(executionTime),
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+});

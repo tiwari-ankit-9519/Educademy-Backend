@@ -1,7 +1,6 @@
 import express from "express";
 import { isLoggedIn } from "../../middlewares/middleware.js";
 import {
-  getAllCourses,
   getCoursesByCategory,
   getFilterOptions,
   getFeaturedCourses,
@@ -18,11 +17,14 @@ import {
   getCoursePlaceholder,
   getFreeCourses,
   getCatalogStats,
+  getAllPublicCourses,
+  getCourseById,
 } from "../../controllers/student/catalog.controller.js";
 
 const router = express.Router();
 
-router.get("/courses", getAllCourses);
+router.get("/courses", getAllPublicCourses);
+router.get("/course/:courseId", getCourseById);
 router.get("/filter-options", getFilterOptions);
 router.get("/courses/featured", getFeaturedCourses);
 router.get("/courses/trending", getTrendingCourses);

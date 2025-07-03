@@ -73,8 +73,21 @@ export const getEnrolledCourses = asyncHandler(async (req, res) => {
     const pageNumber = Math.max(parseInt(page), 1);
     const skip = (pageNumber - 1) * pageSize;
 
+    const studentProfile = await prisma.student.findUnique({
+      where: { userId: req.userAuthId },
+      select: { id: true },
+    });
+
+    if (!studentProfile) {
+      return res.status(404).json({
+        success: false,
+        message: "Student profile not found",
+        code: "STUDENT_NOT_FOUND",
+      });
+    }
+
     const where = {
-      studentId: req.studentProfile.id,
+      studentId: studentProfile.id,
     };
 
     if (status && status !== "ALL") {
@@ -155,6 +168,7 @@ export const getEnrolledCourses = asyncHandler(async (req, res) => {
     const result = {
       enrollments: enrollments.map((enrollment) => ({
         id: enrollment.id,
+        studentId: enrollment.studentId,
         enrolledAt: enrollment.createdAt,
         lastAccessedAt: enrollment.lastAccessedAt,
         progress: enrollment.progress,
@@ -199,6 +213,7 @@ export const getEnrolledCourses = asyncHandler(async (req, res) => {
             }
           : null,
       })),
+
       pagination: {
         page: pageNumber,
         limit: pageSize,
@@ -804,7 +819,6 @@ export const completeLesson = asyncHandler(async (req, res) => {
 
   try {
     const { lessonId } = req.params;
-    const { timeSpent, watchTime } = req.body;
 
     const lesson = await prisma.lesson.findUnique({
       where: { id: lessonId },
@@ -841,6 +855,13 @@ export const completeLesson = asyncHandler(async (req, res) => {
       });
     }
 
+    const lessonStartedAt =
+      enrollment.lastAccessedAt || enrollment.createdAt || new Date();
+    const timeSpentCalculated = Math.round(
+      (Date.now() - new Date(lessonStartedAt).getTime()) / 1000
+    );
+    const watchTimeCalculated = timeSpentCalculated;
+
     const existingCompletion = await prisma.lessonCompletion.findUnique({
       where: {
         studentId_lessonId: {
@@ -857,11 +878,11 @@ export const completeLesson = asyncHandler(async (req, res) => {
         data: {
           timeSpent: Math.max(
             existingCompletion.timeSpent || 0,
-            timeSpent || 0
+            timeSpentCalculated
           ),
           watchTime: Math.max(
             existingCompletion.watchTime || 0,
-            watchTime || 0
+            watchTimeCalculated
           ),
         },
       });
@@ -870,8 +891,8 @@ export const completeLesson = asyncHandler(async (req, res) => {
         data: {
           studentId: req.studentProfile.id,
           lessonId: lessonId,
-          timeSpent: timeSpent || 0,
-          watchTime: watchTime || 0,
+          timeSpent: timeSpentCalculated,
+          watchTime: watchTimeCalculated,
         },
       });
 
@@ -879,7 +900,7 @@ export const completeLesson = asyncHandler(async (req, res) => {
         where: { id: enrollment.id },
         data: {
           lessonsCompleted: { increment: 1 },
-          totalTimeSpent: { increment: timeSpent || 0 },
+          totalTimeSpent: { increment: timeSpentCalculated },
           lastAccessedAt: new Date(),
         },
       });
@@ -1294,7 +1315,15 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
 
   try {
     const { attemptId } = req.params;
-    const { answers, timeSpent } = req.body;
+    const { answers } = req.body;
+
+    if (!Array.isArray(answers)) {
+      return res.status(400).json({
+        success: false,
+        message: "Answers must be an array",
+        code: "INVALID_ANSWERS_FORMAT",
+      });
+    }
 
     const attempt = await prisma.quizAttempt.findUnique({
       where: { id: attemptId },
@@ -1308,7 +1337,7 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
                   include: {
                     enrollments: {
                       where: {
-                        studentId: req.userAuthId,
+                        studentId: req.studentProfile.id,
                         status: "ACTIVE",
                       },
                     },
@@ -1330,7 +1359,7 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
       });
     }
 
-    if (attempt.studentId !== req.userAuthId) {
+    if (attempt.studentId !== req.studentProfile.id) {
       return res.status(403).json({
         success: false,
         message: "This attempt does not belong to you",
@@ -1378,7 +1407,7 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
           content: JSON.stringify(answerData.answer),
           isCorrect,
           points,
-          timeSpent: answerData.timeSpent || 0,
+          timeSpent: 0,
         },
       });
 
@@ -1392,6 +1421,10 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
     const percentage = totalPoints > 0 ? (totalScore / totalPoints) * 100 : 0;
     const isPassed = percentage >= attempt.quiz.passingScore;
 
+    const timeSpentCalculated = Math.round(
+      (Date.now() - new Date(attempt.createdAt).getTime()) / 1000
+    );
+
     const updatedAttempt = await prisma.quizAttempt.update({
       where: { id: attempt.id },
       data: {
@@ -1400,7 +1433,7 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
         percentage,
         isPassed,
         completedQuestions: answers.length,
-        timeSpent: timeSpent || 0,
+        timeSpent: timeSpentCalculated,
         status: "SUBMITTED",
         gradedAt: new Date(),
       },
@@ -1411,19 +1444,19 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
         where: { id: enrollment.id },
         data: {
           quizzesCompleted: { increment: 1 },
-          totalTimeSpent: { increment: timeSpent || 0 },
+          totalTimeSpent: { increment: timeSpentCalculated },
           lastAccessedAt: new Date(),
         },
       });
 
       await updateCourseProgress(
-        req.userAuthId,
+        req.studentProfile.id,
         attempt.quiz.section.course.id
       );
     }
 
     const progressData = await getCourseProgressData(
-      req.userAuthId,
+      req.studentProfile.id,
       attempt.quiz.section.course.id
     );
 
@@ -1441,7 +1474,7 @@ export const submitQuizAttempt = asyncHandler(async (req, res) => {
     }
 
     await checkAndAwardCertificate(
-      req.userAuthId,
+      req.studentProfile.id,
       attempt.quiz.section.course.id,
       progressData
     );
